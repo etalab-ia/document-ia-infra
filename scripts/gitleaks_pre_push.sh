@@ -3,15 +3,16 @@
 #
 # Le script natif scripts/pre-push transmet chaque ligne du protocole Git :
 # <ref locale> <SHA local> <ref distante> <SHA distant> <remote>
-# Il appelle ensuite les hooks pre-commit avec les deux SHA. Les tests manuels
-# peuvent aussi fournir PRE_COMMIT_FROM_REF / PRE_COMMIT_TO_REF ou, à défaut,
+# Les appels sans argument (via pre-commit ou tests manuels) peuvent fournir
+# PRE_COMMIT_FROM_REF / PRE_COMMIT_TO_REF ou, à défaut,
 # PRE_COMMIT_LOCAL_BRANCH et PRE_COMMIT_REMOTE_NAME.
 #
 # Échec (code de sortie non nul) => push bloqué.
 
 set -euo pipefail
 
-CONFIG=".gitleaks.toml"
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+CONFIG="${REPO_ROOT}/.gitleaks.toml"
 ZERO_SHA="0000000000000000000000000000000000000000"
 
 if ! command -v gitleaks >/dev/null 2>&1; then
@@ -27,7 +28,7 @@ if [ "$#" -eq 5 ]; then
   REMOTE="$5"
 elif [ "$#" -eq 0 ]; then
   LOCAL_REF="${PRE_COMMIT_LOCAL_BRANCH:-HEAD}"
-  LOCAL_SHA="${PRE_COMMIT_TO_REF:-}"
+  LOCAL_SHA="${PRE_COMMIT_TO_REF:-$(git rev-parse --verify "${LOCAL_REF}^{commit}")}"
   REMOTE_SHA="${PRE_COMMIT_FROM_REF:-}"
   REMOTE="${PRE_COMMIT_REMOTE_NAME:-origin}"
 else
@@ -35,21 +36,21 @@ else
   exit 1
 fi
 
-if [ -z "$LOCAL_SHA" ] || [ "$LOCAL_SHA" = "$ZERO_SHA" ]; then
+if [ "$LOCAL_SHA" = "$ZERO_SHA" ]; then
   # Une suppression de référence ne publie aucun nouveau commit.
   exit 0
 fi
 
-if [ -n "$REMOTE_SHA" ] && [ "$REMOTE_SHA" != "$ZERO_SHA" ]; then
+if [ -n "$REMOTE_SHA" ] && [ "$REMOTE_SHA" != "$ZERO_SHA" ] && git cat-file -e "${REMOTE_SHA}^{commit}" 2>/dev/null; then
   RANGE="${REMOTE_SHA}..${LOCAL_SHA}"
 else
-  # Nouvelle branche ou nouveau tag : scanner les commits absents de toutes
-  # les branches distantes. Utiliser --remotes exclurait les ancêtres d'autres
-  # tags déjà publiés.
-  RANGE="${LOCAL_REF} --not --remotes=${REMOTE}"
+  # Nouvelle branche, nouveau tag, ou REMOTE_SHA absent localement :
+  # scanner tous les commits atteignables depuis LOCAL_SHA absents du remote.
+  RANGE="${LOCAL_SHA} --not --remotes=${REMOTE}"
 fi
 
 gitleaks git \
   --log-opts="${RANGE}" \
   --config "${CONFIG}" \
-  --redact --verbose
+  --redact --verbose \
+  "${REPO_ROOT}"

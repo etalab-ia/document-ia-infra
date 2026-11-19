@@ -92,8 +92,8 @@ Standard S3 requests (`ListBuckets`, `CreateBucket`, `GetObject`, `PutObject`) d
 
 To enforce the zero-secrets guarantee on this public repository, automated controls run both locally (via Nix-provided `gitleaks` and `pre-commit`) and in GitHub Actions:
 
-* **Secret scanning (Gitleaks)**: Full Git history scan (`fetch-depth: 0`) against [`.gitleaks.toml`](../.gitleaks.toml) with custom `scaleway-access-key` and `document-ia-token` rules, explicit allowlisting of `.env.local.example`, zero historical baseline, and active synthetic probes ([`scripts/verify_gitleaks_synthetic.sh`](../scripts/verify_gitleaks_synthetic.sh)).
-* **Dependency & workflow vulnerability gate (OSV-Scanner + Policy D7)**: Blocking recursive scan of `uv.lock` and `.github/workflows/*.yml`, 30-day maximum exception cap in [`.osv-scanner.toml`](../.osv-scanner.toml), and SARIF upload to GitHub Code Scanning.
+* **Secret scanning (Gitleaks)**: Full Git history scan (`fetch-depth: 0`) against [`.gitleaks.toml`](../.gitleaks.toml) with custom `scaleway-access-key` and `document-ia-token` rules, scoped placeholder allowlisting for `.env.local.example` (`[[allowlists]]` with `condition = "AND"`), zero historical baseline, and active synthetic probes ([`scripts/verify_gitleaks_synthetic.sh`](../scripts/verify_gitleaks_synthetic.sh)).
+* **Dependency vulnerability gate (OSV-Scanner + Policy D7)**: Blocking recursive scan of `uv.lock` (and any supported lockfiles discovered via `--recursive ./`), 30-day maximum exception cap in [`.osv-scanner.toml`](../.osv-scanner.toml), and SARIF upload to GitHub Code Scanning.
 * **Automated updates (Dependabot)**: Weekly grouped updates for `uv` and `github-actions` with a 7-day cooldown ([`.github/dependabot.yml`](../.github/dependabot.yml)).
 
 See [docs/VULNERABILITY_MANAGEMENT_POLICY.md](VULNERABILITY_MANAGEMENT_POLICY.md) for the complete policy specification, Mermaid diagrams, exception governance rules, and required GitHub Branch Protection checks.

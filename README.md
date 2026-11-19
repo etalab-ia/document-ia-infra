@@ -11,6 +11,7 @@ Dépôt d'Infrastructure as Code (**IaC**) pour le projet **Document IA**, dépl
 > **Documentation technique détaillée (en anglais)** :
 > * [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — Architecture globale, diagrammes et décisions techniques (ADRs).
 > * [docs/SECURITY_AND_SECRETS.md](docs/SECURITY_AND_SECRETS.md) — Modèle de sécurité, matrice d'isolation locale et matrice IAM Scaleway.
+> * [docs/VULNERABILITY_MANAGEMENT_POLICY.md](docs/VULNERABILITY_MANAGEMENT_POLICY.md) — Politique CI/CD de sécurité : OSV-Scanner (Politique D7), Gitleaks, Dependabot et Branch Protection.
 
 ---
 

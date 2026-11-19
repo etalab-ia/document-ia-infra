@@ -1,9 +1,9 @@
-# Contrôle opposable des vulnérabilités de dépendances et workflows GitHub Actions (Politique D7).
+# Contrôle opposable des vulnérabilités de dépendances (Politique D7).
 #
 # Ce workflow est bloquant sur tous les événements (pull_request, merge_group,
 # push sur main, schedule hebdomadaire et workflow_dispatch) :
-# 1. Toute nouvelle vulnérabilité non acceptée dans `uv.lock` ou les workflows
-#    GitHub Actions (`.github/workflows/*.yml`) bloque la CI.
+# 1. Toute nouvelle vulnérabilité non acceptée dans `uv.lock` et les lockfiles
+#    détectés récursivement (`--recursive ./`) bloque la CI.
 # 2. Toute exception dans `.osv-scanner.toml` doit être justifiée, attribuée
 #    (`[Owner: @...]`), datée (`YYYY-MM-DD` non quotée) et expirable (`ignoreUntil` <= 30 jours).
 # 3. Toute exception expirée ou mal formée bloque immédiatement la CI.
@@ -25,7 +25,7 @@ permissions: {}
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   osv-scan:
@@ -47,10 +47,10 @@ jobs:
         with:
           python-version: '3.14'
 
-      - name: Exécuter OSV-Scanner (uv.lock et workflows GitHub Actions)
+      - name: Exécuter OSV-Scanner (uv.lock et lockfiles détectés récursivement)
         id: scan
         continue-on-error: true
-        uses: google/osv-scanner-action/osv-scanner-action@0a65f82af05cd58cf587827b0bb0489548c18346 # v2.7.0
+        uses: google/osv-scanner-action/osv-scanner-action@b1d267aea5211fa648d9d442fa64b90dbdcbdd36 # v2.7.0
         with:
           scan-args: |-
             --output-file=osv-results.json
@@ -77,7 +77,7 @@ jobs:
         id: reporter
         if: ${{ !cancelled() && steps.check-scan-output.outputs.json_ready == 'true' && hashFiles('osv-results.json') != '' }}
         continue-on-error: true
-        uses: google/osv-scanner-action/osv-reporter-action@0a65f82af05cd58cf587827b0bb0489548c18346 # v2.7.0
+        uses: google/osv-scanner-action/osv-reporter-action@b1d267aea5211fa648d9d442fa64b90dbdcbdd36 # v2.7.0
         with:
           scan-args: |-
             --output-files=osv-results.sarif

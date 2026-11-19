@@ -12,7 +12,7 @@ permissions: {}
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   uv-lock:
@@ -74,8 +74,11 @@ jobs:
       - name: Pyright - Typage statique (bloquant)
         run: uv run pyright
 
+      - name: Install Gitleaks
+        uses: ./.github/actions/install-gitleaks
+
       - name: Pytest - Tests unitaires
-        run: uv run pytest --maxfail=1 --disable-warnings
+        run: uv run pytest -v -rs --maxfail=1
 
   gitleaks:
     name: Gitleaks (historique complet)
@@ -85,7 +88,7 @@ jobs:
       contents: read
     # Historique 100 % sain (zéro baseline historique) ; toute détection fait
     # échouer la CI. La sonde synthétique vérifie en outre la détection active
-    # ainsi que l'exclusion explicite de .env.local.example.
+    # ainsi que l'exclusion scopée de .env.local.example.
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -94,20 +97,12 @@ jobs:
           persist-credentials: false
 
       - name: Install Gitleaks
-        run: |
-          GITLEAKS_VERSION="8.30.1"
-          GITLEAKS_SHA256="551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
-          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" -o /tmp/gitleaks.tar.gz
-          echo "${GITLEAKS_SHA256}  /tmp/gitleaks.tar.gz" | sha256sum -c -
-          tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
-          sudo mv /tmp/gitleaks /usr/local/bin/gitleaks
-          rm -f /tmp/gitleaks.tar.gz
-          gitleaks version
+        uses: ./.github/actions/install-gitleaks
 
       - name: Gitleaks (historique Git complet)
         run: |
           gitleaks git --config .gitleaks.toml --verbose --redact .
 
-      - name: Vérifier les sondes synthétiques et l'exclusion .env.local.example
+      - name: Vérifier les sondes synthétiques et l'exclusion scopée .env.local.example
         run: |
           bash scripts/verify_gitleaks_synthetic.sh

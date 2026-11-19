@@ -2,9 +2,11 @@
 # Vérifie l'opposabilité du contrôle Gitleaks pour document-ia-infra :
 # 1. Contrôle négatif #1 : un commit de `.env.local.example` avec placeholders Scaleway passe (exit 0).
 # 2. Contrôle négatif #2 : un commit contenant un placeholder autorisé (`YOUR_API_KEY`) passe (exit 0).
-# 3. Sonde positive #1 (`scaleway-access-key`) : une clé `SCW...` construite par fragments est détectée et bloquée.
-# 4. Sonde positive #2 (`document-ia-token`) : un token `dia_...` construit par fragments est détecté et bloqué.
-# 5. Sonde positive #3 (`generic-api-key`) : une clé API haute entropie construite par fragments est détectée et bloquée.
+# 3. Sonde positive #1 (`scaleway-access-key` dans `.env.local.example`) : une vraie clé `SCW_ACCESS_KEY` dans `.env.local.example` est détectée et bloquée.
+# 4. Sonde positive #2 (`generic-api-key` dans `.env.local.example`) : un vrai UUID `SCW_SECRET_KEY` dans `.env.local.example` est détecté et bloqué.
+# 5. Sonde positive #3 (`scaleway-access-key`) : une clé `SCW...` construite par fragments est détectée et bloquée.
+# 6. Sonde positive #4 (`document-ia-token`) : un token `dia_...` (incluant `-` Base64URL) construit par fragments est détecté et bloqué.
+# 7. Sonde positive #5 (`generic-api-key`) : une clé API haute entropie construite par fragments est détectée et bloquée.
 
 set -euo pipefail
 
@@ -63,7 +65,7 @@ git -C "${TMP_DIR}" config user.email "security-probe@document-ia.local"
 git -C "${TMP_DIR}" config commit.gpgsign false
 cp "${CONFIG_PATH}" "${TMP_DIR}/.gitleaks.toml"
 
-echo "==> [1/5] Contrôle négatif #1 (.env.local.example exclu dans .gitleaks.toml)..."
+echo "==> [1/7] Contrôle négatif #1 (.env.local.example avec placeholders Scaleway)..."
 # Fragments pour qu'aucun motif SCW[A-Z0-9]{17} littéral n'apparaisse dans ce script
 SCW_EX_PREFIX="SCW"
 SCW_EX_BODY="XXXXXXXXXXXXXXXXX"
@@ -77,12 +79,12 @@ git -C "${TMP_DIR}" add .gitleaks.toml .env.local.example
 git -C "${TMP_DIR}" commit -q -m "chore: add .env.local.example with Scaleway placeholders"
 
 if ! gitleaks git --config "${TMP_DIR}/.gitleaks.toml" --redact "${TMP_DIR}"; then
-  echo "erreur : Gitleaks a échoué sur .env.local.example alors qu'il est explicitement exclu." >&2
+  echo "erreur : Gitleaks a échoué sur .env.local.example avec placeholders autorisés." >&2
   exit 1
 fi
-echo "OK : Contrôle négatif #1 (.env.local.example) passe (exit 0)."
+echo "OK : Contrôle négatif #1 (.env.local.example avec placeholders) passe (exit 0)."
 
-echo "==> [2/5] Contrôle négatif #2 (placeholder autorisé dans .gitleaks.toml)..."
+echo "==> [2/7] Contrôle négatif #2 (placeholder autorisé dans .gitleaks.toml)..."
 PLACEHOLDER_A="YOUR_API"
 PLACEHOLDER_B="_KEY"
 cat > "${TMP_DIR}/sample.py" <<EOF
@@ -99,7 +101,61 @@ if ! gitleaks git --config "${TMP_DIR}/.gitleaks.toml" --redact "${TMP_DIR}"; th
 fi
 echo "OK : Contrôle négatif #2 (placeholder autorisé) passe (exit 0)."
 
-echo "==> [3/5] Sonde positive #1 (règle personnalisée 'scaleway-access-key')..."
+echo "==> [3/7] Sonde positive #1 (vraie SCW_ACCESS_KEY dans .env.local.example bloquée)..."
+SCW_ENV_P1="SCW"
+SCW_ENV_P2="9A8B7C6D"
+SCW_ENV_P3="5E4F3G2H1"
+cat > "${TMP_DIR}/.env.local.example" <<EOF
+SCW_ACCESS_KEY="${SCW_ENV_P1}${SCW_ENV_P2}${SCW_ENV_P3}"
+SCW_SECRET_KEY="${SCW_EX_SECRET}"
+SCW_DEFAULT_PROJECT_ID="${SCW_EX_SECRET}"
+EOF
+git -C "${TMP_DIR}" add .env.local.example
+git -C "${TMP_DIR}" commit -q -m "test: inject real SCW_ACCESS_KEY into .env.local.example"
+
+REPORT_ENV_SCW="${TMP_DIR}/report_env_scw_key.json"
+if gitleaks git \
+  --config "${TMP_DIR}/.gitleaks.toml" \
+  --report-format json \
+  --report-path "${REPORT_ENV_SCW}" \
+  --redact \
+  "${TMP_DIR}" >/dev/null 2>&1; then
+  echo "erreur : Gitleaks n'a PAS bloqué une vraie SCW_ACCESS_KEY dans .env.local.example !" >&2
+  exit 1
+fi
+verify_rule_in_report "${REPORT_ENV_SCW}" "scaleway-access-key"
+
+echo "==> [4/7] Sonde positive #2 (vrai UUID SCW_SECRET_KEY dans .env.local.example bloqué)..."
+git -C "${TMP_DIR}" reset -q --hard "${CLEAN_SHA}"
+
+UUID_P1="f47ac10b"
+UUID_P2="58cc"
+UUID_P3="4372"
+UUID_P4="a567"
+UUID_P5="0e02b2c3d479"
+cat > "${TMP_DIR}/.env.local.example" <<EOF
+SCW_ACCESS_KEY="${SCW_EX_PREFIX}${SCW_EX_BODY}"
+SCW_SECRET_KEY="${UUID_P1}-${UUID_P2}-${UUID_P3}-${UUID_P4}-${UUID_P5}"
+SCW_DEFAULT_PROJECT_ID="${SCW_EX_SECRET}"
+EOF
+git -C "${TMP_DIR}" add .env.local.example
+git -C "${TMP_DIR}" commit -q -m "test: inject real UUID SCW_SECRET_KEY into .env.local.example"
+
+REPORT_ENV_UUID="${TMP_DIR}/report_env_scw_secret.json"
+if gitleaks git \
+  --config "${TMP_DIR}/.gitleaks.toml" \
+  --report-format json \
+  --report-path "${REPORT_ENV_UUID}" \
+  --redact \
+  "${TMP_DIR}" >/dev/null 2>&1; then
+  echo "erreur : Gitleaks n'a PAS bloqué un vrai UUID SCW_SECRET_KEY dans .env.local.example !" >&2
+  exit 1
+fi
+verify_rule_in_report "${REPORT_ENV_UUID}" "generic-api-key"
+
+echo "==> [5/7] Sonde positive #3 (règle personnalisée 'scaleway-access-key')..."
+git -C "${TMP_DIR}" reset -q --hard "${CLEAN_SHA}"
+
 SCW_P1="SCW"
 SCW_P2="SYNTH987"
 SCW_P3="K4M2P6Q8W"
@@ -121,12 +177,12 @@ if gitleaks git \
 fi
 verify_rule_in_report "${REPORT_SCW}" "scaleway-access-key"
 
-echo "==> [4/5] Sonde positive #2 (règle personnalisée 'document-ia-token')..."
+echo "==> [6/7] Sonde positive #4 (règle personnalisée 'document-ia-token')..."
 git -C "${TMP_DIR}" reset -q --hard "${CLEAN_SHA}"
 
 DIA_P1="dia_"
-DIA_P2="prod_v1_"
-DIA_P3="SYNTH999_"
+DIA_P2="prod-v1_"
+DIA_P3="SYNTH999-"
 DIA_P4="K8M2P9Q4R7T1V5W3X6Y8Z2B4N6M8Q1W3E5R7_"
 DIA_P5="Z9X8"
 SYNTH_DIA_TOKEN="${DIA_P1}${DIA_P2}${DIA_P3}${DIA_P4}${DIA_P5}"
@@ -147,7 +203,7 @@ if gitleaks git \
 fi
 verify_rule_in_report "${REPORT_DIA}" "document-ia-token"
 
-echo "==> [5/5] Sonde positive #3 (règle par défaut 'generic-api-key')..."
+echo "==> [7/7] Sonde positive #5 (règle par défaut 'generic-api-key')..."
 git -C "${TMP_DIR}" reset -q --hard "${CLEAN_SHA}"
 
 K_LEFT="api"
