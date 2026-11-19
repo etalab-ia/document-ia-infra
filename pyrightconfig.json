@@ -2,7 +2,7 @@
   "pythonVersion": "3.14",
   "venvPath": ".",
   "venv": ".venv",
-  "include": ["lib", "stacks"],
+  "include": ["lib", "stacks", "scripts", "tests"],
   "extraPaths": ["lib", "stacks"],
   "typeCheckingMode": "standard"
 }
