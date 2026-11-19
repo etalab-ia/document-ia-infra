@@ -1,0 +1,2 @@
+# Copier vers `.envrc` puis lancer `direnv allow` pour activer automatiquement le flake Nix.
+use flake

@@ -1,0 +1,8 @@
+name: test
+description: Stack de test Document IA (validation backend Scaleway + Nix + Pulumi Python 3.14)
+runtime:
+  name: python
+  options:
+    toolchain: uv
+    virtualenv: ../../.venv
+    typechecker: pyright
