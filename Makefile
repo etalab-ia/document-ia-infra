@@ -1,7 +1,7 @@
 env ?= dev
 stack ?= test
 
-.PHONY: help bootstrap stack-init preview up destroy output lint typecheck check
+.PHONY: help bootstrap stack-init preview up destroy output lint format-check typecheck test gitleaks check
 .DEFAULT_GOAL := help
 
 help: ## Affiche cette aide
@@ -36,10 +36,20 @@ destroy: ## Détruit les ressources de stacks/$(stack) pour $(env)
 output: ## Affiche les outputs de stacks/$(stack) pour $(env)
 	@pulumi -C stacks/$(stack) stack output --stack $(env) --json
 
-lint: ## Vérifie le formatage et le linting Python avec Ruff
-	@uv run ruff check lib stacks
+lint: ## Vérifie le linting Python avec Ruff
+	@uv run ruff check lib stacks scripts tests
+
+format-check: ## Vérifie le formatage Python avec Ruff
+	@uv run ruff format --check lib stacks scripts tests
 
 typecheck: ## Vérifie le typage statique Python avec Pyright
 	@uv run pyright
 
-check: lint typecheck ## Exécute tous les contrôles statiques (ruff + pyright)
+test: ## Exécute la suite de tests Pytest
+	@uv run pytest -v
+
+gitleaks: ## Scanne l'historique Git et exécute la sonde synthétique Gitleaks
+	@gitleaks git --config .gitleaks.toml --verbose --redact .
+	@bash scripts/verify_gitleaks_synthetic.sh
+
+check: lint format-check typecheck test ## Exécute tous les contrôles statiques et tests (ruff + format + pyright + pytest)

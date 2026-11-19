@@ -1,0 +1,46 @@
+# .gitleaks.toml
+title = "Configuration Gitleaks — document-ia-infra"
+
+# Conserve l'ensemble des règles par défaut de Gitleaks.
+[extend]
+useDefault = true
+
+# ---------------------------------------------------------
+# 1. LISTE BLANCHE (Exclusions globales anti-faux positifs)
+# ---------------------------------------------------------
+[allowlist]
+description = "Exclusions globales pour éviter les faux positifs"
+paths = [
+    # Fichier d'exemple d'environnement local (contient des placeholders SCW_ACCESS_KEY/SCW_SECRET_KEY)
+    '''^\.env\.local\.example$''',
+
+    # Environnements virtuels Python et état local Pulumi
+    '''^\.venv/.*$''',
+    '''^\.pulumi/.*$''',
+
+    # Fichiers de verrouillage (fortes entropies SHA-256 / SRI)
+    '''^uv\.lock$''',
+    '''^flake\.lock$''',
+]
+
+# Ignorer des faux positifs documentaires récurrents dans le code
+regexes = [
+    '''gitleaks:allow''',
+    '''example_token_for_tests''',
+    '''YOUR_API_KEY''',
+    '''your-api-key-here''',
+]
+
+# ---------------------------------------------------------
+# 2. RÈGLES PERSONNALISÉES
+# ---------------------------------------------------------
+
+[[rules]]
+id = "scaleway-access-key"
+description = "Détection des clés d'accès IAM Scaleway (SCW...)"
+regex = '''SCW[A-Z0-9]{17}'''
+
+[[rules]]
+id = "document-ia-token"
+description = "Détection des tokens d'environnement DocumentIA (dia_...)"
+regex = '''dia_[a-zA-Z0-9_]{40,100}'''

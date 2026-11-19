@@ -34,6 +34,8 @@
               gnumake
               openssl
               direnv
+              gitleaks
+              pre-commit
             ];
 
             shellHook = ''
