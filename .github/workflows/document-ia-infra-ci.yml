@@ -1,0 +1,108 @@
+name: document-ia-infra CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  merge_group:
+  workflow_dispatch:
+
+# Aucun droit par défaut : chaque job déclare uniquement ce dont il a besoin.
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  uv-lock:
+    name: uv (verrou de dépendances)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "0.13.6"
+          enable-cache: true
+
+      - name: Vérifier la cohérence du verrou uv.lock
+        run: uv lock --check
+
+  build-lint-test:
+    name: Build, Lint, Pyright & Pytest
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.14'
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "0.13.6"
+          enable-cache: true
+
+      - name: Installer les dépendances (lockfile strict)
+        run: uv sync --locked
+
+      - name: Construire les artefacts Python (wheel & sdist)
+        run: uv build
+
+      - name: Ruff - Lint
+        run: uv run ruff check lib stacks scripts tests
+
+      - name: Ruff - Formatage
+        run: uv run ruff format --check lib stacks scripts tests
+
+      - name: Pyright - Typage statique (bloquant)
+        run: uv run pyright
+
+      - name: Install Gitleaks
+        uses: ./.github/actions/install-gitleaks
+
+      - name: Pytest - Tests unitaires
+        run: uv run pytest -v -rs --maxfail=1
+
+  gitleaks:
+    name: Gitleaks (historique complet)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    # Historique 100 % sain (zéro baseline historique) ; toute détection fait
+    # échouer la CI. La sonde synthétique vérifie en outre la détection active
+    # ainsi que l'exclusion scopée de .env.local.example.
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Gitleaks
+        uses: ./.github/actions/install-gitleaks
+
+      - name: Gitleaks (historique Git complet)
+        run: |
+          gitleaks git --config .gitleaks.toml --verbose --redact .
+
+      - name: Vérifier les sondes synthétiques et l'exclusion scopée .env.local.example
+        run: |
+          bash scripts/verify_gitleaks_synthetic.sh

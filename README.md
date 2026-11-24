@@ -2,7 +2,7 @@
 
 Dépôt d'Infrastructure as Code (**IaC**) pour le projet **Document IA**, déployé sur le projet Scaleway **`DocumentIA`** (Organisation DINUM).
 
-* **Nix Flakes** : environnement 100 % reproductible (`python314`, `uv`, `pulumi`, `scaleway-cli`, `awscli2`, `jq`, `make`, `openssl`).
+* **Nix Flakes** : environnement 100 % reproductible (`python314`, `uv`, `pulumi`, `scaleway-cli`, `awscli2`, `jq`, `make`, `openssl`, `gitleaks`, `pre-commit`).
 * **Isolation totale de votre machine** : aucune lecture ni écriture dans `~/.pulumi`, `~/.config/scw` ou `~/.aws`.
 * **Zéro secret ni identifiant interne dans Git** : ni clés, ni UUID de projet DINUM, ni nom de bucket de state ne sont versionnés.
 * **Traçabilité individuelle (Audit Trail / Cockpit Grafana)** : chaque développeur utilise sa propre clé API IAM Scaleway.
@@ -11,6 +11,7 @@ Dépôt d'Infrastructure as Code (**IaC**) pour le projet **Document IA**, dépl
 > **Documentation technique détaillée (en anglais)** :
 > * [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — Architecture globale, diagrammes et décisions techniques (ADRs).
 > * [docs/SECURITY_AND_SECRETS.md](docs/SECURITY_AND_SECRETS.md) — Modèle de sécurité, matrice d'isolation locale et matrice IAM Scaleway.
+> * [docs/VULNERABILITY_MANAGEMENT_POLICY.md](docs/VULNERABILITY_MANAGEMENT_POLICY.md) — Politique CI/CD de sécurité : OSV-Scanner (Politique D7), Gitleaks, Dependabot et Branch Protection.
 
 ---
 
@@ -93,8 +94,15 @@ direnv allow
 Dans le shell `nix develop` :
 
 ```bash
-# Vérifier le linting (Ruff) et le typage strict (Pyright)
+# Installer les hooks locaux pre-commit et pre-push (Ruff + Gitleaks) — une fois par clone
+pre-commit install
+bash scripts/pre-push
+
+# Vérifier le linting (Ruff), le formatage, le typage strict (Pyright) et les tests (Pytest)
 make check
+
+# Vérifier l'absence de secrets dans l'historique Git et exécuter les sondes Gitleaks
+make gitleaks
 
 # Vérifier l'accès au backend S3 et à la stack de test (lecture seule)
 make preview stack=test env=dev
@@ -146,8 +154,14 @@ make destroy stack=test env=dev
 # Recharger le vault / .env.local sans quitter le shell Nix
 infra-reload
 
-# Contrôles qualité (Ruff + Pyright)
+# Contrôles qualité & tests (Ruff + format + Pyright + Pytest)
 make check
+
+# Tests unitaires seuls
+make test
+
+# Scan Gitleaks (historique complet + sondes synthétiques)
+make gitleaks
 ```
 
 ### Mode hors-ligne (sans accès Scaleway)
@@ -196,13 +210,27 @@ pulumi -C stacks/test config set --stack dev --secret ma_cle "ma_valeur"
 ├── .envrc.example             # Modèle direnv (`use flake`)
 ├── Makefile                   # Commandes opérationnelles (bootstrap, preview, up, destroy, check)
 ├── pyproject.toml             # Dépendances Python 3.14 (uv), Ruff, Pyright & package infra_lib
+├── .github/
+│   ├── dependabot.yml         # Mises à jour hebdomadaires uv & github-actions (cooldown 7j)
+│   └── workflows/
+│       ├── document-ia-infra-ci.yml  # CI : uv lock, uv build, Ruff, Pyright, Pytest, Gitleaks
+│       └── osv-scanner.yml    # Scan vulnérabilités OSV-Scanner & Politique D7 (bloquant)
+├── .gitleaks.toml             # Règles Gitleaks (Scaleway, Document IA, exclusion .env.local.example)
+├── .osv-scanner.toml          # Exceptions temporaires OSV (Politique D7, <= 30j)
+├── .pre-commit-config.yaml    # Hooks locaux pre-commit / pre-push (Ruff, Gitleaks, uv lock)
 ├── docs/
-│   ├── ARCHITECTURE.md        # Architecture détaillée, diagrammes Mermaid & ADRs
-│   └── SECURITY_AND_SECRETS.md# Modèle de sécurité, isolation locale & matrice IAM Scaleway
+│   ├── ARCHITECTURE.md                  # Architecture détaillée, diagrammes Mermaid & ADRs
+│   ├── SECURITY_AND_SECRETS.md          # Modèle de sécurité, isolation locale & matrice IAM Scaleway
+│   └── VULNERABILITY_MANAGEMENT_POLICY.md # Politique CI/CD sécurité (OSV/D7, Gitleaks, Dependabot)
 ├── scripts/
-│   ├── load_env.sh            # Isolation locale + chargement Scaleway Vault + profil S3 éphémère
-│   └── bootstrap.sh           # Initialisation unique (bucket S3 versionné + secret vault)
+│   ├── load_env.sh                      # Isolation locale + chargement Scaleway Vault + profil S3 éphémère
+│   ├── bootstrap.sh                     # Initialisation unique (bucket S3 versionné + secret vault)
+│   ├── check_vulnerability_policy.py    # Validateur Politique D7 & déduplication Union-Find OSV
+│   ├── verify_gitleaks_synthetic.sh     # Sondes synthétiques Gitleaks & contrôle .env.local.example
+│   ├── pre-push                         # Wrapper hook Git pre-push multi-références
+│   └── gitleaks_pre_push.sh             # Scan Gitleaks des commits sortants
 ├── lib/infra_lib/             # Helpers communs (InfraContext, nommage, tags, StackReference typées)
+├── tests/                     # Suite de tests Pytest (infra_lib, Politique D7, sonde Gitleaks)
 └── stacks/
     └── test/                  # Stack de test initiale (validation backend S3 & Pyright)
 ```
