@@ -736,7 +736,74 @@ flowchart LR
     CRON_DBT -->|"Transform :5432"| PG_ANA
 ```
 
-#### 4.4.3. Defense-in-Depth Network Security Matrix
+#### 4.4.3. Deep Dive — Inside the Kapsule Kubernetes Cluster (Node Pools, Operators & Workloads)
+
+```mermaid
+flowchart LR
+    classDef ingress fill:#fff3cd,stroke:#d97706,stroke-width:2px,color:#78350f
+    classDef control fill:#e0e7ff,stroke:#4338ca,stroke-width:2px,color:#1e1b4b
+    classDef sys fill:#f1f5f9,stroke:#475569,stroke-width:2px,color:#1e293b
+    classDef app fill:#e6f4ea,stroke:#1e7e34,stroke-width:2px,color:#14532d
+    classDef worker fill:#dcfce7,stroke:#15803d,stroke-width:2px,color:#14532d
+    classDef cron fill:#e0f2fe,stroke:#0369a1,stroke-width:2px,color:#0c4a6e
+    classDef data fill:#f3e8ff,stroke:#7c3aed,stroke-width:2px,color:#4c1d95
+
+    LB["Scaleway Load Balancer<br/>TCP 80/443 · Proxy Protocol v2"]:::ingress
+
+    subgraph KAPSULE["Scaleway Kubernetes Kapsule (Managed Control Plane · CNI Cilium)"]
+        CP["Managed Control Plane<br/>API Server · Scheduler · Cluster Autoscaler"]:::control
+
+        subgraph POOL_SYS["Node Pool: api-system (public_ip_disabled=True · autohealing=True · 2x PRO2-S Prod)"]
+            subgraph NS_SYS["Namespaces Systeme (stacks/cluster)"]
+                TRAEFIK["Traefik Ingress Controller<br/>TLS 1.3 · trustedIPs: 172.16.x.0/22"]:::ingress
+                CERTMGR["cert-manager<br/>Let's Encrypt HTTP-01"]:::sys
+                KEDA_OP["KEDA Operator<br/>Poll Redis Lag (30s)"]:::sys
+            end
+
+            subgraph NS_APP_SYS["Namespace docia-&lt;env&gt; — Services & CronJobs (stacks/apps)"]
+                EVALS["Deployment: document-ia-evals<br/>Streamlit :8501 · ProConnect OIDC"]:::app
+                API["Deployment: document-ia-api<br/>FastAPI :8000 · 1Gi · startupProbe"]:::app
+                CRONS["3 CronJobs (batch/v1)<br/>remove-ppi (03:00)<br/>replicate-analytics (05:00)<br/>dbt-transform (05:30)"]:::cron
+            end
+        end
+
+        subgraph POOL_WRK["Node Pool: workers (public_ip_disabled=True · autoscaling=True · 1..5x PRO2-S Prod)"]
+            subgraph NS_APP_WRK["Namespace docia-&lt;env&gt; — Traitement IA/OCR (stacks/apps)"]
+                KEDA_SO["KEDA ScaledObject + TriggerAuth<br/>lagCount=10 · +1/2min · -1/5min"]:::sys
+                WORKERS["Deployment: document-ia-worker<br/>2Gi RAM/pod · ~2 pods/PRO2-S<br/>1 thread CPU (semaphore) + 7 HTTP I/O<br/>Graceful drain 180s + XAUTOCLAIM"]:::worker
+            end
+        end
+    end
+
+    subgraph PN_DATA["Services Prives (pn-&lt;env&gt; & pn-analytics)"]
+        REDIS[("Managed Redis 7+ (:6379 TLS)<br/>event_stream · webhook_stream")]:::data
+        PG_MAIN[("PG Main (:5432)<br/>event_store · api_key")]:::data
+        PG_ANA[("PG Analytics (:5432)<br/>172.16.0.10/32")]:::data
+    end
+
+    %% Ingress & TLS
+    LB -->|"PPv2"| TRAEFIK
+    CERTMGR -.->|"Certificats TLS 1.3"| TRAEFIK
+    TRAEFIK -->|"console.*"| EVALS
+    TRAEFIK -->|"api.*"| API
+    EVALS -->|"HTTP :8000"| API
+
+    %% Scaling loop (KEDA -> Workers -> Cluster Autoscaler)
+    KEDA_OP --> KEDA_SO
+    KEDA_SO -.->|"Scale 1..N pods"| WORKERS
+    WORKERS -.->|"Pod Pending -> Ajoute VM PRO2-S"| CP
+
+    %% Private Data Flows
+    API -->|"XADD / Quotas"| REDIS
+    API -->|"SQL :5432"| PG_MAIN
+    CRONS -->|"SQL :5432"| PG_MAIN
+    CRONS -->|"SQL :5432"| PG_ANA
+    WORKERS -->|"XREADGROUP / XACK"| REDIS
+    WORKERS -->|"SQL :5432"| PG_MAIN
+    KEDA_OP -->|"XINFO GROUPS (TLS+CA)"| REDIS
+```
+
+#### 4.4.4. Defense-in-Depth Network Security Matrix
 
 | Source Component | Allowed Private Network Destinations | Allowed Outbound Egress (via Public Gateway NAT) | Blocked by VPC ACL, Application & Cilium `NetworkPolicy` |
 |---|---|---|---|
