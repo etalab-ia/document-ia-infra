@@ -214,7 +214,7 @@ flowchart TD
 
 * **Decision**:
   1. Provision a **single shared private Scaleway Container Registry** (`rg.fr-par.scw.cloud`) in `stacks/base` (`env=shared`), paired with a dedicated CI push IAM Application, so `document-ia` builds immutable multi-stage Nix `FROM scratch` images once and promotes them across `staging`, `sandbox`, and `prod`.
-  2. Activate **Scaleway Cockpit** (managed Loki + Prometheus/Mimir + Grafana) once in `stacks/base` (`env=shared`), while creating per-boundary scoped `observability.Token` (`write_logs=True`) credentials in `stacks/network`.
+  2. Activate **Scaleway Cockpit** (managed Loki + Prometheus/Mimir + Grafana) and provision a dedicated custom **`scaleway.observability.Source` (`type="logs"`)** once in `stacks/base` (`env=shared`) — automatically wired as a Loki datasource in Cockpit Grafana and exposing its HTTPS `push_url` — while creating per-boundary **write-only** `scaleway.observability.Token` credentials (`write_logs=True`, `query_logs=False`, `write_metrics=False`, `setup_*_rules=False`) in `stacks/network` (no mTLS enrollment required; zero read/admin rights if a pod token leaks).
   3. Manage **Grafana dashboards and alerting declaratively as code** in a dedicated stack **`stacks/observability` (`env=shared`)**:
      * **Dashboards**: Versioned JSON files (`stacks/observability/dashboards/*.json`) provisioned into a custom `Document IA` folder via **`pulumiverse-grafana`**, authenticating to Scaleway Cockpit's Grafana endpoint using Scaleway IAM (`auth="anonymous"` + `X-Auth-Token: <SCW_SECRET_KEY>` — no legacy Grafana user/password).
      * **Infrastructure Alerts**: Managed natively via **`scaleway.observability.AlertManager`** (`preconfigured_alert_ids` for Kapsule, PostgreSQL RDB, Redis, Load Balancer + notification `contact_points`).
@@ -598,7 +598,154 @@ flowchart TB
 
 ---
 
-### 4.4. Defense-in-Depth Network Security Matrix
+### 4.4. Deep Dive — Network Isolation & Defense-in-Depth
+
+Network isolation is enforced across **two complementary layers**:
+1. **Layer L3 Inter-Private-Network (Scaleway VPC Network ACL)** — stateless `/32`-pinned firewall isolating environments (`staging`, `sandbox`, `prod`) and blocking Metabase from reaching any compute network.
+2. **Layer L3/L4 Intra-Cluster (Cilium `NetworkPolicy`)** — per-pod East-West and Egress allowlists inside each Kapsule namespace (`docia-<env>`).
+
+#### 4.4.1. Inter-Private-Network Isolation (Shared VPC, VPC ACL `/32`, Gateways & Managed Services)
+
+```mermaid
+flowchart LR
+    classDef internet fill:#e8f4fd,stroke:#1d6fa5,stroke-width:2px,color:#0d3b66
+    classDef gateway fill:#fff3cd,stroke:#d97706,stroke-width:2px,color:#78350f
+    classDef prod fill:#dcfce7,stroke:#15803d,stroke-width:2px,color:#14532d
+    classDef nonprod fill:#e0f2fe,stroke:#0369a1,stroke-width:2px,color:#0c4a6e
+    classDef analytics fill:#f3e8ff,stroke:#7c3aed,stroke-width:2px,color:#4c1d95
+    classDef acl fill:#fee2e2,stroke:#dc2626,stroke-width:2px,color:#7f1d1d
+    classDef scwService fill:#f1f5f9,stroke:#475569,stroke-width:2px,color:#1e293b
+
+    subgraph INTERNET_IN["Internet (Entree)"]
+        USERS(["Utilisateurs & Clients API"]):::internet
+        DNS["DNS (OVH)"]:::internet
+    end
+
+    subgraph PUBLIC_IN["Points d'entree Publics"]
+        LB["Load Balancer Public<br/>(1 par cluster · api.* / console.*)"]:::gateway
+        METABASE["Metabase BI<br/>(metabase.* · Serverless Container)"]:::gateway
+    end
+
+    subgraph VPC["VPC Prive Scaleway (docia-shared-vpc · fr-par · Zero IP Publique)"]
+        subgraph PN_STG["pn-staging (172.16.4.0/22)"]
+            STG_RES["Kapsule + PG Main + Redis"]:::nonprod
+        end
+
+        subgraph PN_SBX["pn-sandbox (172.16.8.0/22)"]
+            SBX_RES["Kapsule + PG Main + Redis"]:::nonprod
+        end
+
+        subgraph PN_PRD["pn-prod (172.16.12.0/22)"]
+            PRD_RES["Kapsule + PG Main (HA) + Redis (HA)"]:::prod
+        end
+
+        VPC_ACL{{"VPC Network ACL (Stateless · default_policy=DROP)<br/>Bloque tout trafic inter-environnements & Metabase -> env<br/>Autorise UNIQUEMENT pn-* -> 172.16.0.10/32:5432 (+ retour)"}}:::acl
+
+        subgraph PN_ANA["pn-analytics (172.16.0.0/24)"]
+            PG_ANA[("PostgreSQL Analytics<br/>IP fixe: 172.16.0.10/32 (:5432)")]:::analytics
+        end
+    end
+
+    subgraph PUBLIC_OUT["Sortie Public Gateway"]
+        PGW["Public Gateway (NAT Sortant)<br/>Couvre aussi l'acces Bastion SSH<br/>(non-prod: ON · prod: break-glass)"]:::gateway
+    end
+
+    subgraph DEST_OUT["Internet (Sortie) & Services Manages Scaleway"]
+        EXT["Internet — Services Externes<br/>(Albert · ProConnect · Webhooks)"]:::internet
+        subgraph MANAGED["Services Manages Scaleway (fr-par)"]
+            S3[("Object Storage S3<br/>(BucketPolicy stricte)")]:::scwService
+            REG["Container Registry"]:::scwService
+            COCKPIT["Cockpit (Loki / Grafana)"]:::scwService
+        end
+    end
+
+    %% Entrees Internet -> Points d'entree Publics -> VPC
+    USERS -->|"HTTPS"| DNS
+    DNS -->|"api.* / console.*"| LB
+    DNS -->|"metabase.*"| METABASE
+
+    LB --> STG_RES
+    LB --> SBX_RES
+    LB --> PRD_RES
+    METABASE -->|"L2 local pn-analytics (:5432)"| PG_ANA
+
+    %% Isolation inter-reseaux via VPC ACL
+    STG_RES -.-x|"DROP"| SBX_RES
+    SBX_RES -.-x|"DROP"| PRD_RES
+    STG_RES -->|"SQL :5432"| VPC_ACL
+    SBX_RES -->|"SQL :5432"| VPC_ACL
+    PRD_RES -->|"SQL :5432"| VPC_ACL
+    VPC_ACL -->|"Autorise /32"| PG_ANA
+
+    %% Sorties VPC -> Public Gateway -> Internet & Services Manages
+    STG_RES -->|"NAT"| PGW
+    SBX_RES -->|"NAT"| PGW
+    PRD_RES -->|"NAT"| PGW
+
+    PGW -->|"HTTPS"| EXT
+    PGW --> S3
+    PGW --> REG
+    PGW --> COCKPIT
+```
+
+#### 4.4.2. Intra-Cluster Isolation (Cilium `NetworkPolicy` per Workload in `docia-<env>`)
+
+```mermaid
+flowchart LR
+    classDef ingress fill:#fff3cd,stroke:#d97706,stroke-width:2px,color:#78350f
+    classDef app fill:#e6f4ea,stroke:#1e7e34,stroke-width:2px,color:#14532d
+    classDef cron fill:#e0f2fe,stroke:#0369a1,stroke-width:2px,color:#0c4a6e
+    classDef data fill:#f3e8ff,stroke:#7c3aed,stroke-width:2px,color:#4c1d95
+    classDef egress fill:#f1f5f9,stroke:#475569,stroke-width:2px,color:#1e293b
+
+    subgraph ENTRY["Ingress Cluster"]
+        LB["Scaleway LB<br/>TCP 80/443 + PPv2<br/>use-hostname=true"]:::ingress
+        TRAEFIK["Traefik + cert-manager<br/>trustedIPs: 172.16.x.0/22"]:::ingress
+    end
+
+    subgraph NS["Namespace docia-&lt;env&gt; (Cilium NetworkPolicy · Default-Deny)"]
+        EVALS["document-ia-evals (:8501)<br/>Secret: docia-evals-secret"]:::app
+        API["document-ia-api (:8000)<br/>Secret: docia-api-secret"]:::app
+        WORKER["document-ia-worker<br/>Secret: docia-worker-secret"]:::app
+        KEDA["KEDA Operator<br/>Secret: docia-keda-redis-secret"]:::app
+        CRON_PPI["CronJob: remove-ppi<br/>Secret: docia-cron-ppi-secret"]:::cron
+        CRON_REPL["CronJob: replicate-analytics<br/>Secret: docia-cron-analytics-secret"]:::cron
+        CRON_DBT["CronJob: dbt-transform<br/>Secret: docia-cron-dbt-secret"]:::cron
+    end
+
+    subgraph TARGETS["Destinations Autorisees (Privees & NAT Egress)"]
+        PG_MAIN[("PG Main (:5432)<br/>172.16.x.x")]:::data
+        REDIS[("Redis (:6379 TLS)<br/>172.16.x.x")]:::data
+        PG_ANA[("PG Analytics (:5432)<br/>172.16.0.10/32")]:::data
+        EGRESS_APP["NAT Egress (:443)<br/>S3 · Albert · ProConnect<br/>Webhooks · Cockpit Loki"]:::egress
+    end
+
+    %% Ingress routing
+    LB -->|"PPv2"| TRAEFIK
+    TRAEFIK -->|"console.*"| EVALS
+    TRAEFIK -->|"api.*"| API
+
+    %% Allowed East-West pod flows
+    EVALS -->|"HTTP :8000"| API
+    EVALS -->|"ProConnect / Loki"| EGRESS_APP
+
+    API -->|"SQL :5432"| PG_MAIN
+    API -->|"TLS :6379"| REDIS
+    API -->|"S3 / Webhooks / Loki"| EGRESS_APP
+
+    WORKER -->|"SQL :5432"| PG_MAIN
+    WORKER -->|"TLS :6379"| REDIS
+    WORKER -->|"S3 / Albert / Loki"| EGRESS_APP
+
+    KEDA -->|"TLS + CA :6379"| REDIS
+
+    CRON_PPI -->|"SQL :5432"| PG_MAIN
+    CRON_REPL -->|"Read :5432"| PG_MAIN
+    CRON_REPL -->|"Write :5432"| PG_ANA
+    CRON_DBT -->|"Transform :5432"| PG_ANA
+```
+
+#### 4.4.3. Defense-in-Depth Network Security Matrix
 
 | Source Component | Allowed Private Network Destinations | Allowed Outbound Egress (via Public Gateway NAT) | Blocked by VPC ACL, Application & Cilium `NetworkPolicy` |
 |---|---|---|---|
@@ -811,7 +958,7 @@ All persistence layers rely on **Scaleway-native mechanisms** with strict region
 |---|---|---|---|
 | **Shared Regional VPC** | `network.Vpc` | `enable_routing=True` (`docia-shared-vpc`, `fr-par`); hosts all isolated Private Networks with non-overlapping CIDRs | Project-wide |
 | **VPC Network ACL** | `network.Acl` | `default_policy="drop"` (`is_ipv6=False`); stateless rules pinned to the exact `/32` IP of `docia-shared-pg-analytics` (`pn-<boundary> -> 172.16.0.10/32:5432` and matching return `172.16.0.10/32:5432 -> pn-<boundary>:1024-65535`); blocks all cross-env traffic and prevents Metabase (in `pn-analytics`) from initiating source-port-5432 traffic to compute PNs | Project-wide |
-| **Scaleway Cockpit** | `observability.Cockpit` | Activates managed Loki / Prometheus / Grafana once for Scaleway project `DocumentIA` | Project singleton |
+| **Scaleway Cockpit & Log Source** | `observability.Cockpit` + `observability.Source` (`type="logs"`) | Activates managed Loki / Prometheus / Grafana once for `DocumentIA` and provisions the custom application Loki datasource (`push_url`, auto-wired in Cockpit Grafana; read access strictly via Scaleway IAM SSO) | Project singleton |
 | **Shared Container Registry** | `registry.Namespace` | `is_public=False`, regional `fr-par` OCI registry (`docia-shared`) hosting immutable images promoted across environments | Project-wide |
 | **CI Registry IAM App** | `iam.Application` + `Policy` + `ApiKey` | Dedicated least-privilege `ContainerRegistryFullAccess` identity for GitHub Actions image pushes (`document-ia`) | Project-wide |
 
@@ -823,7 +970,7 @@ All persistence layers rely on **Scaleway-native mechanisms** with strict region
 | **Public Gateway IP** | `vpcgw.Ip` | Static outbound IPv4 for NAT egress & optional SSH Bastion | 1 static IPv4 | 1 static IPv4 |
 | **Public Gateway** | `vpcgw.Gateway` + `GatewayNetwork` | `enable_masquerade=True`, attached to `PrivateNetwork`; **`bastion_enabled=True`** in non-prod/staging (with optional `bastion_allowed_ips`), **`bastion_enabled=False` by default in `prod`** (break-glass toggle + `bastion_allowed_ips` via Pulumi config) | `VPC-GW-S` (`bastion=on`) | `VPC-GW-M` (`bastion=off`, break-glass) |
 | **Reserved Ingress IP** | `loadbalancers.Ip` | Static public IPv4 reserved early, pointed to by OVH DNS `A` records, and bound to Traefik via Scaleway CCM in `stacks/cluster` | 1 static IPv4 | 1 static IPv4 |
-| **Cockpit Push Token** | `observability.Token` | `scopes={"write_logs": True}`, exported via encrypted Pulumi `stack_secrets` (`cockpit_loki_token`) | 1 token per boundary | 1 token |
+| **Cockpit Push Token** | `observability.Token` | **Write-only** (`write_logs=True`, `query_logs=False`, `setup_*_rules=False`, HTTPS `X-Token` / `Bearer` — no mTLS needed), exported via encrypted Pulumi `stack_secrets` (`cockpit_loki_token`) | 1 token per boundary | 1 token |
 
 #### Layer 1B — Stack `stacks/analytics` (`env=shared`, Private Analytics RDB, Schema RBAC & Metabase Serverless Container)
 
@@ -1022,7 +1169,7 @@ Because `stacks/analytics` and `stacks/observability` depend only on `stacks/bas
 ```mermaid
 flowchart LR
     VPC["scaleway.network.Vpc<br/>(docia-shared-vpc, enable_routing=True)"] --> VPC_ACL["scaleway.network.Acl<br/>(default_policy='drop'<br/>Allow ONLY pn-* -> 172.16.0.10/32:5432 + return)"]
-    COCKPIT["scaleway.observability.Cockpit<br/>(DocumentIA Project Singleton)"]
+    COCKPIT["scaleway.observability.Cockpit<br/>+ Source (type='logs', auto-wired in Grafana)"]
     REG["scaleway.registry.Namespace<br/>(docia-shared, is_public=False)"]
     CI_APP["scaleway.iam.Application<br/>(docia-ci-registry)"] --> CI_POL["scaleway.iam.Policy<br/>(ContainerRegistryFullAccess)"]
     CI_POL --> CI_KEY["scaleway.iam.ApiKey"]
