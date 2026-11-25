@@ -301,46 +301,46 @@ flowchart LR
     classDef security fill:#fee2e2,stroke:#dc2626,stroke-width:2px,color:#7f1d1d
     classDef scwService fill:#f1f5f9,stroke:#475569,stroke-width:2px,color:#1e293b
 
-    subgraph INBOUND["Internet (Entree)"]
-        USERS(["Utilisateurs & Clients API"]):::internet
+    subgraph INBOUND["Internet (Inbound)"]
+        USERS(["Users & API Consumers"]):::internet
         DNS["DNS (OVH)"]:::internet
     end
 
-    subgraph ENTRY["Points d'entree Publics"]
-        LB["Load Balancer Public<br/>(api.* · console.*)"]:::gateway
+    subgraph ENTRY["Public Entry Points"]
+        LB["Public Load Balancer<br/>(api.* · console.*)"]:::gateway
         METABASE["Metabase BI<br/>(metabase.*)"]:::gateway
     end
 
-    subgraph VPC["VPC Prive Scaleway — Zero IP Publique"]
-        subgraph PN_ENV["Reseau Prive Environnement"]
-            KAPSULE["Cluster Kubernetes Kapsule"]:::privateCompute
+    subgraph VPC["Scaleway Private VPC — Zero Public IP"]
+        subgraph PN_ENV["Environment Private Network"]
+            KAPSULE["Kapsule Kubernetes Cluster"]:::privateCompute
             PG_MAIN[("PostgreSQL")]:::privateData
             REDIS[("Redis")]:::privateData
         end
 
-        VPC_ACL{{"VPC Network ACL (DROP par defaut)<br/>Autorise uniquement SQL vers Analytics"}}:::security
+        VPC_ACL{{"VPC Network ACL (Default DROP)<br/>Allows SQL to Analytics only"}}:::security
 
-        subgraph PN_ANA["Reseau Prive Analytics"]
+        subgraph PN_ANA["Analytics Private Network"]
             PG_ANA[("PostgreSQL Analytics")]:::privateData
         end
     end
 
-    subgraph EGRESS["Sortie NAT & Bastion"]
-        PGW["Public Gateway<br/>(NAT Sortant · Bastion SSH)"]:::gateway
+    subgraph EGRESS["NAT Egress & Bastion"]
+        PGW["Public Gateway<br/>(Outbound NAT · SSH Bastion)"]:::gateway
     end
 
-    subgraph OUTBOUND["Destinations Sortantes"]
-        EXT["Services Externes<br/>(Albert · ProConnect · Webhooks)"]:::internet
+    subgraph OUTBOUND["Outbound Destinations"]
+        EXT["External Services<br/>(Albert · ProConnect · Webhooks)"]:::internet
         S3[("Object Storage S3")]:::scwService
         REG["Container Registry"]:::scwService
-        COCKPIT["Cockpit (Observabilite)"]:::scwService
+        COCKPIT["Cockpit (Observability)"]:::scwService
     end
 
     USERS -->|"HTTPS"| DNS
     DNS -->|"api.* / console.*"| LB
     DNS -->|"metabase.*"| METABASE
     LB --> KAPSULE
-    METABASE -->|"Reseau prive"| PG_ANA
+    METABASE -->|"Private network"| PG_ANA
 
     KAPSULE --> PG_MAIN
     KAPSULE --> REDIS
@@ -616,17 +616,17 @@ flowchart LR
     classDef acl fill:#fee2e2,stroke:#dc2626,stroke-width:2px,color:#7f1d1d
     classDef scwService fill:#f1f5f9,stroke:#475569,stroke-width:2px,color:#1e293b
 
-    subgraph INTERNET_IN["Internet (Entree)"]
-        USERS(["Utilisateurs & Clients API"]):::internet
+    subgraph INTERNET_IN["Internet (Inbound)"]
+        USERS(["Users & API Consumers"]):::internet
         DNS["DNS (OVH)"]:::internet
     end
 
-    subgraph PUBLIC_IN["Points d'entree Publics"]
-        LB["Load Balancer Public<br/>(1 par cluster · api.* / console.*)"]:::gateway
+    subgraph PUBLIC_IN["Public Entry Points"]
+        LB["Public Load Balancer<br/>(1 per cluster · api.* / console.*)"]:::gateway
         METABASE["Metabase BI<br/>(metabase.* · Serverless Container)"]:::gateway
     end
 
-    subgraph VPC["VPC Prive Scaleway (docia-shared-vpc · fr-par · Zero IP Publique)"]
+    subgraph VPC["Scaleway Private VPC (docia-shared-vpc · fr-par · Zero Public IP)"]
         subgraph PN_STG["pn-staging (172.16.4.0/22)"]
             STG_RES["Kapsule + PG Main + Redis"]:::nonprod
         end
@@ -639,27 +639,27 @@ flowchart LR
             PRD_RES["Kapsule + PG Main (HA) + Redis (HA)"]:::prod
         end
 
-        VPC_ACL{{"VPC Network ACL (Stateless · default_policy=DROP)<br/>Bloque tout trafic inter-environnements & Metabase -> env<br/>Autorise UNIQUEMENT pn-* -> 172.16.0.10/32:5432 (+ retour)"}}:::acl
+        VPC_ACL{{"VPC Network ACL (Stateless · default_policy=DROP)<br/>Blocks all cross-environment & Metabase -> env traffic<br/>Allows ONLY pn-* -> 172.16.0.10/32:5432 (+ return)"}}:::acl
 
         subgraph PN_ANA["pn-analytics (172.16.0.0/24)"]
-            PG_ANA[("PostgreSQL Analytics<br/>IP fixe: 172.16.0.10/32 (:5432)")]:::analytics
+            PG_ANA[("PostgreSQL Analytics<br/>Fixed IP: 172.16.0.10/32 (:5432)")]:::analytics
         end
     end
 
-    subgraph PUBLIC_OUT["Sortie Public Gateway"]
-        PGW["Public Gateway (NAT Sortant)<br/>Couvre aussi l'acces Bastion SSH<br/>(non-prod: ON · prod: break-glass)"]:::gateway
+    subgraph PUBLIC_OUT["Public Gateway Egress"]
+        PGW["Public Gateway (Outbound NAT)<br/>Also provides SSH Bastion access<br/>(non-prod: ON · prod: break-glass)"]:::gateway
     end
 
-    subgraph DEST_OUT["Internet (Sortie) & Services Manages Scaleway"]
-        EXT["Internet — Services Externes<br/>(Albert · ProConnect · Webhooks)"]:::internet
-        subgraph MANAGED["Services Manages Scaleway (fr-par)"]
-            S3[("Object Storage S3<br/>(BucketPolicy stricte)")]:::scwService
+    subgraph DEST_OUT["Internet (Outbound) & Scaleway Managed Services"]
+        EXT["Internet — External Services<br/>(Albert · ProConnect · Webhooks)"]:::internet
+        subgraph MANAGED["Scaleway Managed Services (fr-par)"]
+            S3[("Object Storage S3<br/>(Strict BucketPolicy)")]:::scwService
             REG["Container Registry"]:::scwService
             COCKPIT["Cockpit (Loki / Grafana)"]:::scwService
         end
     end
 
-    %% Entrees Internet -> Points d'entree Publics -> VPC
+    %% Inbound Internet -> Public Entry Points -> VPC
     USERS -->|"HTTPS"| DNS
     DNS -->|"api.* / console.*"| LB
     DNS -->|"metabase.*"| METABASE
@@ -667,17 +667,17 @@ flowchart LR
     LB --> STG_RES
     LB --> SBX_RES
     LB --> PRD_RES
-    METABASE -->|"L2 local pn-analytics (:5432)"| PG_ANA
+    METABASE -->|"Local L2 pn-analytics (:5432)"| PG_ANA
 
-    %% Isolation inter-reseaux via VPC ACL
+    %% Cross-network isolation via VPC ACL
     STG_RES -.-x|"DROP"| SBX_RES
     SBX_RES -.-x|"DROP"| PRD_RES
     STG_RES -->|"SQL :5432"| VPC_ACL
     SBX_RES -->|"SQL :5432"| VPC_ACL
     PRD_RES -->|"SQL :5432"| VPC_ACL
-    VPC_ACL -->|"Autorise /32"| PG_ANA
+    VPC_ACL -->|"Allowed /32"| PG_ANA
 
-    %% Sorties VPC -> Public Gateway -> Internet & Services Manages
+    %% Outbound VPC -> Public Gateway -> Internet & Managed Services
     STG_RES -->|"NAT"| PGW
     SBX_RES -->|"NAT"| PGW
     PRD_RES -->|"NAT"| PGW
@@ -698,21 +698,21 @@ flowchart LR
     classDef data fill:#f3e8ff,stroke:#7c3aed,stroke-width:2px,color:#4c1d95
     classDef egress fill:#f1f5f9,stroke:#475569,stroke-width:2px,color:#1e293b
 
-    LB["Scaleway LB (Public)<br/>1 par cluster · TCP 80/443 · PPv2<br/>use-hostname=true"]:::ingress
+    LB["Scaleway LB (Public)<br/>1 per cluster · TCP 80/443 · PPv2<br/>use-hostname=true"]:::ingress
 
-    subgraph KAPSULE["Cluster Kapsule du sous-reseau pn-&lt;env&gt;"]
-        TRAEFIK["Traefik + cert-manager<br/>(Namespace systeme du cluster)<br/>trustedIPs: 172.16.x.0/22"]:::ingress
+    subgraph KAPSULE["Kapsule Cluster in pn-&lt;env&gt;"]
+        TRAEFIK["Traefik + cert-manager<br/>(Cluster System Namespace)<br/>trustedIPs: 172.16.x.0/22"]:::ingress
 
-        subgraph NS["Namespace docia-&lt;env&gt; (Cilium Default-Deny + 7 Secrets dedies)"]
-            EVALS["Console: document-ia-evals (:8501)<br/>Secret: docia-evals-secret<br/>(Aucun acces DB / Redis)"]:::app
-            CORE["Core Runtime: API · Worker · KEDA<br/>Secrets: docia-api / worker / keda-redis<br/>(Aucun acces PG Analytics)"]:::app
+        subgraph NS["Namespace docia-&lt;env&gt; (Cilium Default-Deny + 7 Role-Scoped Secrets)"]
+            EVALS["Console: document-ia-evals (:8501)<br/>Secret: docia-evals-secret<br/>(No DB / Redis access)"]:::app
+            CORE["Core Runtime: API · Worker · KEDA<br/>Secrets: docia-api / worker / keda-redis<br/>(No PG Analytics access)"]:::app
             CRON_PPI["CronJob: remove-ppi (03:00)<br/>Secret: docia-cron-ppi-secret"]:::cron
             CRON_REPL["CronJob: replicate-analytics (05:00)<br/>Secret: docia-cron-analytics-secret"]:::cron
-            CRON_DBT["CronJob: dbt-transform (05:30)<br/>Secret: docia-cron-dbt-secret<br/>(Aucun acces PG Main)"]:::cron
+            CRON_DBT["CronJob: dbt-transform (05:30)<br/>Secret: docia-cron-dbt-secret<br/>(No PG Main access)"]:::cron
         end
     end
 
-    subgraph TARGETS["Destinations Autorisees (Loki :443 autorise pour tous)"]
+    subgraph TARGETS["Allowed Destinations (Loki :443 allowed for all)"]
         NAT_EXT["NAT Egress (:443)<br/>ProConnect · S3 · Albert · Webhooks"]:::egress
         REDIS[("Redis (:6379 TLS + CA)<br/>API · Worker · KEDA")]:::data
         PG_MAIN[("PG Main (:5432)<br/>API · Worker · PPI · Replicate")]:::data
@@ -754,10 +754,10 @@ flowchart LR
         CP["Managed Control Plane<br/>API Server · Scheduler · Cluster Autoscaler"]:::control
 
         subgraph POOL_SYS["Node Pool: api-system (public_ip_disabled=True · autohealing=True · 2x PRO2-S Prod)"]
-            subgraph NS_SYS["Namespaces Systeme (stacks/cluster)"]
+            subgraph NS_SYS["System Namespaces (stacks/cluster)"]
                 TRAEFIK["Traefik Ingress Controller<br/>TLS 1.3 · trustedIPs: 172.16.x.0/22"]:::ingress
                 CERTMGR["cert-manager<br/>Let's Encrypt HTTP-01"]:::sys
-                KEDA_OP["KEDA Operator<br/>Poll Redis Lag (30s)"]:::sys
+                KEDA_OP["KEDA Operator<br/>Polls Redis Lag (30s)"]:::sys
             end
 
             subgraph NS_APP_SYS["Namespace docia-&lt;env&gt; — Services & CronJobs (stacks/apps)"]
@@ -768,14 +768,14 @@ flowchart LR
         end
 
         subgraph POOL_WRK["Node Pool: workers (public_ip_disabled=True · autoscaling=True · 1..5x PRO2-S Prod)"]
-            subgraph NS_APP_WRK["Namespace docia-&lt;env&gt; — Traitement IA/OCR (stacks/apps)"]
+            subgraph NS_APP_WRK["Namespace docia-&lt;env&gt; — AI/OCR Processing (stacks/apps)"]
                 KEDA_SO["KEDA ScaledObject + TriggerAuth<br/>lagCount=10 · +1/2min · -1/5min"]:::sys
-                WORKERS["Deployment: document-ia-worker<br/>2Gi RAM/pod · ~2 pods/PRO2-S<br/>1 thread CPU (semaphore) + 7 HTTP I/O<br/>Graceful drain 180s + XAUTOCLAIM"]:::worker
+                WORKERS["Deployment: document-ia-worker<br/>2Gi RAM/pod · ~2 pods/PRO2-S<br/>1 CPU thread (semaphore) + 7 HTTP I/O<br/>Graceful drain 180s + XAUTOCLAIM"]:::worker
             end
         end
     end
 
-    subgraph PN_DATA["Services Prives (pn-&lt;env&gt; & pn-analytics)"]
+    subgraph PN_DATA["Private Services (pn-&lt;env&gt; & pn-analytics)"]
         REDIS[("Managed Redis 7+ (:6379 TLS)<br/>event_stream · webhook_stream")]:::data
         PG_MAIN[("PG Main (:5432)<br/>event_store · api_key")]:::data
         PG_ANA[("PG Analytics (:5432)<br/>172.16.0.10/32")]:::data
@@ -783,7 +783,7 @@ flowchart LR
 
     %% Ingress & TLS
     LB -->|"PPv2"| TRAEFIK
-    CERTMGR -.->|"Certificats TLS 1.3"| TRAEFIK
+    CERTMGR -.->|"TLS 1.3 Certificates"| TRAEFIK
     TRAEFIK -->|"console.*"| EVALS
     TRAEFIK -->|"api.*"| API
     EVALS -->|"HTTP :8000"| API
@@ -791,7 +791,7 @@ flowchart LR
     %% Scaling loop (KEDA -> Workers -> Cluster Autoscaler)
     KEDA_OP --> KEDA_SO
     KEDA_SO -.->|"Scale 1..N pods"| WORKERS
-    WORKERS -.->|"Pod Pending -> Ajoute VM PRO2-S"| CP
+    WORKERS -.->|"Pod Pending -> Adds PRO2-S VM"| CP
 
     %% Private Data Flows
     API -->|"XADD / Quotas"| REDIS
