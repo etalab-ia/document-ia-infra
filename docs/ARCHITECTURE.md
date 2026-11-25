@@ -125,7 +125,7 @@ sequenceDiagram
   * **Layer 1C — `stacks/observability` (`env=shared`)**: Declarative observability-as-code on Scaleway Cockpit — versioned Grafana dashboards provisioned via `pulumiverse-grafana` (IAM `X-Auth-Token`), `scaleway.observability.AlertManager` (preconfigured infra alerts + contact points), and versioned custom Loki/Mimir alerting rules.
   * **Layer 2 — `stacks/data` (always per environment: `staging`, `sandbox`, `prod`)**: Dedicated S3 Documents bucket (7-day lifecycle + policy-less IAM App + S3 Bucket Policy), Main PostgreSQL RDB (private only), and Managed Redis 7+ (`noeviction`, private only), exporting non-sensitive coordinates in `stack_data` and generated credentials in encrypted `stack_secrets`.
   * **Layer 3 — `stacks/cluster` (per Kubernetes cluster)**: Scaleway Kapsule cluster (`cni="cilium"`), private Node Pools (`api-system`, `workers`), **Traefik** bound to the reserved LB IP via Scaleway CCM (TCP L4 + Proxy Protocol v2), **`cert-manager`** (Let's Encrypt HTTP-01), KEDA Operator, and Kubernetes Namespaces.
-  * **Layer 4 — `stacks/apps` (always per environment: `staging`, `sandbox`, `prod`)**: Application Kubernetes workloads (`document-ia-api`, `document-ia-worker`, `document-ia-evals` exposed on `console.*`, 2 `CronJob`s, KEDA `ScaledObject`, Cilium `NetworkPolicy`, `Ingress` with automated TLS, and **least-privilege role-scoped `core.v1.Secret`s per workload** built from upstream encrypted `stack_secrets` + external secrets stored via `pulumi config set --secret` in `stacks/apps/Pulumi.<env>.yaml`).
+  * **Layer 4 — `stacks/apps` (always per environment: `staging`, `sandbox`, `prod`)**: Application Kubernetes workloads (`document-ia-api`, `document-ia-worker`, `document-ia-evals` exposed on `console.*`, 3 `CronJob`s including `dbt-transform`, KEDA `ScaledObject`, Cilium `NetworkPolicy`, `Ingress` with automated TLS, and **least-privilege role-scoped `core.v1.Secret`s per workload** built from upstream encrypted `stack_secrets` + external secrets stored via `pulumi config set --secret` in `stacks/apps/Pulumi.<env>.yaml`).
 * **Rationale**:
   * **Strict lifecycle separation**: Decoupling slow-changing cluster infrastructure (`stacks/cluster`) from fast-moving application releases (`stacks/apps`) and separating dashboards/alerts (`stacks/observability`) from critical networking (`stacks/base`) keeps blast radius minimal—tweaking a Grafana panel or alert threshold never touches the shared VPC or ACLs.
   * **Zero public IP on any database & clean DAG**: Putting the shared VPC + default-deny VPC Network ACL in `stacks/base` allows `stacks/network` (Layer 1A) and `stacks/analytics` (Layer 1B) to deploy independently in parallel, keeps 100 % of analytics replication traffic inside private RFC 1918 networks, and decouples Metabase completely from Kubernetes clusters.
@@ -192,6 +192,7 @@ flowchart TD
   1. **100 % Private Multi-Environment Connectivity with `/32`-Pinned VPC ACL (Option R1)**: Place all `PrivateNetwork`s inside a **single shared Regional VPC** (`docia-shared-vpc`, declared in `stacks/base` with Scaleway **VPC Routing** enabled) protected by a **default-deny VPC Network ACL** (`scaleway.network.Acl`, `default_policy="drop"`). Provision a dedicated `pn-analytics` (`172.16.0.0/24`) in `stacks/analytics` and attach the shared PostgreSQL Analytics RDB (`docia-shared-pg-analytics`) **exclusively to `pn-analytics`** (zero public IP / empty public ACL) using a **deterministic static private IP** (`analytics_db_private_ip`, e.g., `172.16.0.10/32`, exported from `stacks/base` and assigned via `ip_net` / IPAM reservation).
   2. **Schema-Level RBAC via `pulumi-postgresql`**: Use the **`pulumi-postgresql`** provider to declaratively manage per-environment schemas (`staging`, `sandbox`, `prod`) and least-privilege schema grants (`metabase` RW `public` + RO env schemas; `docia_<env>_analytics` RW strictly on its own `<env>` schema).
   3. **Decoupled Metabase Hosting on Scaleway Serverless Containers (Option M1)**: Deploy **Metabase** directly inside `stacks/analytics` as a **Scaleway Serverless Container** (`min_scale=1`, `max_scale=1`, 2–4 GiB RAM) attached to `pn-analytics`, with a managed TLS Let's Encrypt custom domain (`metabase.document-ia.beta.gouv.fr`).
+  4. **In-VPC `dbt-core` Transformations (Replacing dbt Cloud)**: Run analytics SQL transformations via **`dbt-core` + `dbt-postgres`** as a per-environment Kubernetes `CronJob` (`dbt-transform`, `05:30 UTC` right after `replicate-analytics`) in `stacks/apps` rather than external dbt Cloud SaaS. *(Note: Kubernetes `CronJob` is chosen over Scaleway Serverless Jobs because Scaleway Serverless Jobs do not yet support Private Network attachments in `pulumiverse-scaleway`, whereas Kapsule pods already have VPC-routed private access to `172.16.0.10/32:5432`.)*
 * **Rationale**:
   * **Zero public database exposure**: Every database in Document IA (all per-env Main RDBs AND the Shared Analytics RDB) is 100 % private on RFC 1918 IPs. Scaleway's VPC vRouter routes `pn-<env>` $\rightarrow$ `172.16.0.10/32:5432` privately while the stateless VPC Network ACL (`default_policy="drop"`) guarantees that **zero cross-environment traffic** is ever allowed between `pn-staging`, `pn-sandbox`, and `pn-prod`.
   * **Stateless VPC Network ACL hardened to `/32` (anti-source-port-5432 bypass)**: Because Scaleway VPC ACLs are stateless, `stacks/base` explicitly pairs each inbound rule (`pn-<env> -> 172.16.0.10/32:5432`) with its matching return rule (`172.16.0.10/32:5432 -> pn-<env>:1024-65535`). **Pinning the rule to the exact `/32` IP of `docia-shared-pg-analytics` (rather than the entire `172.16.0.0/24` subnet) is mandatory**: because port `5432` is unprivileged (`> 1024`), a subnet-wide `/24` return rule would allow a compromised Metabase container sharing `pn-analytics` to bind local source port `5432` and initiate outbound TCP connections to `pn-prod` (`pg-main:5432`, `redis:6379`, Kubelet). With `/32` pinning, Metabase communicates locally over L2 with `172.16.0.10:5432` inside `pn-analytics`, while any packet from Metabase's own IP toward `pn-prod` / non-prod PNs is unconditionally dropped by the VPC vRouter.
@@ -326,6 +327,11 @@ classDiagram
         +Startup: Alembic auto_migrate_analytics() on schema=<env>
         +Action: Incremental anonymized upsert to Analytics DB (schema=<env>)
     }
+    class Cron_DbtTransform {
+        +Image: docia-dbt (dbt-core + dbt-postgres, Shared Registry)
+        +Schedule: 30 5 * * * (Daily 05:30 UTC)
+        +Action: Runs dbt models on Analytics DB (schema=<env>, 100% private)
+    }
     class Metabase_BI {
         +Runtime: Scaleway Serverless Container (min_scale=1, :3000)
         +Network: Attached to pn-analytics (100% private DB link)
@@ -336,7 +342,8 @@ classDiagram
     DocumentIA_Worker --> DocumentIA_API : "Publishes webhooks via webhook_stream"
     Cron_RemovePPI ..> DocumentIA_API : "Sanitizes Main DB event_store"
     Cron_ReplicateAnalytics ..> Cron_RemovePPI : "Replicates to Analytics DB schema=<env>"
-    Metabase_BI ..> Cron_ReplicateAnalytics : "Queries anonymized env schemas (RO)"
+    Cron_DbtTransform ..> Cron_ReplicateAnalytics : "Transforms anonymized models in schema=<env>"
+    Metabase_BI ..> Cron_DbtTransform : "Queries transformed env schemas (RO)"
 ```
 
 ---
@@ -533,6 +540,7 @@ flowchart TB
 | **`document-ia-evals`** | Own env `document-ia-api (:8000)`, `CoreDNS (:53)` | ProConnect OIDC (`:443`), Scaleway S3, Cockpit Loki | Direct access to PostgreSQL Main, Analytics DB, or Redis |
 | **`remove-ppi` CronJob** | Own env `PostgreSQL Main (:5432)`, `CoreDNS (:53)` | Cockpit Loki (`:443`) | All external Internet, S3, Redis, Analytics DB |
 | **`replicate-analytics` CronJob** | Own env `PostgreSQL Main (:5432)`, Shared Analytics RDB (`172.16.0.10/32:5432`), `CoreDNS (:53)` | Cockpit Loki (`:443`) | S3, Redis, arbitrary external hosts, other env PNs |
+| **`dbt-transform` CronJob** | Shared Analytics RDB (`172.16.0.10/32:5432`), `CoreDNS (:53)` | Cockpit Loki (`:443`) | `PostgreSQL Main`, S3, Redis, arbitrary external hosts, other env PNs |
 | **Metabase Serverless Container** | Shared Analytics RDB on `pn-analytics` (`172.16.0.10/32:5432`, local L2) | Managed outbound HTTPS (e.g. SMTP / OIDC if configured) | All compute PNs (`pn-staging`, `pn-sandbox`, `pn-non-prod`, `pn-prod`) — blocked by `/32`-pinned VPC ACL (`default_policy=drop`: only `172.16.0.10/32:5432` can reply to compute PNs, never Metabase's IP) |
 
 ---
@@ -544,9 +552,9 @@ To preserve the multi-environment analytics design with **zero public IP on the 
 ```mermaid
 flowchart LR
     subgraph ENVS["Document IA Environments (Inside Shared VPC — Private RFC 1918 Traffic)"]
-        STG_WR["pn-staging (172.16.4.0/22)<br/>replicate-analytics CronJob ONLY<br/>(role: docia_staging_analytics)"]
-        SBX_WR["pn-sandbox (172.16.8.0/22)<br/>replicate-analytics CronJob ONLY<br/>(role: docia_sandbox_analytics)"]
-        PRD_WR["pn-prod (172.16.12.0/22)<br/>replicate-analytics CronJob ONLY<br/>(role: docia_prod_analytics)"]
+        STG_WR["pn-staging (172.16.4.0/22)<br/>replicate-analytics + dbt-transform CronJobs<br/>(role: docia_staging_analytics)"]
+        SBX_WR["pn-sandbox (172.16.8.0/22)<br/>replicate-analytics + dbt-transform CronJobs<br/>(role: docia_sandbox_analytics)"]
+        PRD_WR["pn-prod (172.16.12.0/22)<br/>replicate-analytics + dbt-transform CronJobs<br/>(role: docia_prod_analytics)"]
     end
 
     VPC_ACL["VPC Network ACL (stacks/base)<br/>default_policy=DROP<br/>Allow ONLY pn-* -> 172.16.0.10/32:5432 (+ return)"]
@@ -795,11 +803,11 @@ All persistence layers rely on **Scaleway-native mechanisms** with strict region
 
 | Resource | Pulumi Class (`pulumi_kubernetes`) | Key Configuration | Sizing (`staging` / `sandbox`) | Sizing (`prod`) |
 |---|---|---|---|---|
-| **Role-Scoped Runtime Secrets** | `core.v1.Secret` (6 dedicated secrets) | Least-privilege secrets materialized per workload (`docia-api-secret`, `docia-worker-secret`, `docia-evals-secret`, `docia-cron-ppi-secret`, `docia-cron-analytics-secret`, `docia-keda-redis-secret`) from upstream Pulumi `stack_secrets` + external secrets stored via `pulumi config set --secret` (`stacks/apps/Pulumi.<env>.yaml`: `OPENAI_API_KEY`, `PROCONNECT_CLIENT_SECRET`, `API_KEY_PEPPER_*`, `WEBHOOK_SECRET_ENCRYPTION_KEY`, `DOCUMENT_IA_API_KEY`). Zero plaintext passwords in Pod `env:` specs | 6 scoped Secrets per env | 6 scoped Secrets |
-| **Cilium Isolation** | `networking.v1.NetworkPolicy` | Strict East-West & anti-SSRF rules isolating pods to their own env's Main RDB, Redis, `pg-analytics` (`172.16.0.10/32:5432`, for **`replicate-analytics` CronJob only**), and authorized egress | Applied per env namespace | Applied per env namespace |
+| **Role-Scoped Runtime Secrets** | `core.v1.Secret` (7 dedicated secrets) | Least-privilege secrets materialized per workload (`docia-api-secret`, `docia-worker-secret`, `docia-evals-secret`, `docia-cron-ppi-secret`, `docia-cron-analytics-secret`, `docia-cron-dbt-secret`, `docia-keda-redis-secret`) from upstream Pulumi `stack_secrets` + external secrets stored via `pulumi config set --secret` (`stacks/apps/Pulumi.<env>.yaml`: `OPENAI_API_KEY`, `PROCONNECT_CLIENT_SECRET`, `API_KEY_PEPPER_*`, `WEBHOOK_SECRET_ENCRYPTION_KEY`, `DOCUMENT_IA_API_KEY`). Zero plaintext passwords in Pod `env:` specs | 7 scoped Secrets per env | 7 scoped Secrets |
+| **Cilium Isolation** | `networking.v1.NetworkPolicy` | Strict East-West & anti-SSRF rules isolating pods to their own env's Main RDB, Redis, `pg-analytics` (`172.16.0.10/32:5432`, for **`replicate-analytics` & `dbt-transform` CronJobs only**), and authorized egress | Applied per env namespace | Applied per env namespace |
 | **API & Console (Evals)** | `apps.v1.Deployment` + `core.v1.Service` | • `document-ia-api` (`1Gi` RAM, `AUTO_MIGRATE=true`, `startupProbe` + `/api/v1/health` probes)<br/>• `document-ia-evals` (Streamlit Console + ProConnect OIDC) | 1 API replica, 1 Console replica | 1 API replica at launch *(multi-replica requires `document-ia` migration lock)*, 1–2 Console replicas |
 | **Workers & KEDA** | `apps.v1.Deployment` + `keda.sh/v1alpha1.TriggerAuthentication` + `ScaledObject` | `document-ia-worker` (prewarms 4 SHA-256 AI models, consumes `event_stream`, `terminationGracePeriodSeconds: 180`) + KEDA `TriggerAuthentication` (Redis TLS `ca` + auth) & `ScaledObject` (`lagCount: "10"`, `enableTLS: "true"`, `+1/120s` up, `300s` stabilization & `-1/300s` down) | 1..3 replicas | 1–2..5–10 replicas |
-| **Scheduled Jobs** | `batch.v1.CronJob` | • `remove-ppi` (`0 3 * * *`, size `S` equivalent)<br/>• `replicate-analytics` (`0 5 * * *`, `ANALYTICS_POSTGRES_SCHEMA=<env>`, size `L` equivalent) | 2 CronJobs | 2 CronJobs |
+| **Scheduled Jobs** | `batch.v1.CronJob` | • `remove-ppi` (`0 3 * * *`, size `S` equivalent)<br/>• `replicate-analytics` (`0 5 * * *`, `ANALYTICS_POSTGRES_SCHEMA=<env>`, size `L` equivalent)<br/>• `dbt-transform` (`30 5 * * *`, `dbt-core` + `dbt-postgres` on `schema=<env>`, replaces dbt Cloud) | 3 CronJobs | 3 CronJobs |
 | **Ingress (Automated TLS)** | `networking.v1.Ingress` | Host-based TLS 1.3 routing (`api.<env>.*`, `console.<env>.*`; prod: `api.*`, `console.*`) targeting **Traefik** with `cert-manager.io/cluster-issuer: letsencrypt-prod` (DNS `A` records hosted on OVH) | Per-env hostnames | Prod hostnames |
 
 ---
@@ -1273,6 +1281,7 @@ class ClusterStackSecrets(TypedDict): # Exported via pulumi.Output.secret(...) u
 | `docia-evals-secret` | `document-ia-evals` | `PROCONNECT_CLIENT_SECRET`, `DOCUMENT_IA_API_KEY` (internal API auth), `LOKI_BEARER_TOKEN` | `PG_MAIN`, `PG_ANALYTICS`, `REDIS`, `S3`, `API_KEY_PEPPER_*`, `WEBHOOK_SECRET_ENCRYPTION_KEY` |
 | `docia-cron-ppi-secret` | `remove-ppi` CronJob | `PG_MAIN`, `LOKI_BEARER_TOKEN` | `REDIS`, `S3`, `PG_ANALYTICS`, `OPENAI_API_KEY`, `PROCONNECT_*`, `PEPPERS` |
 | `docia-cron-analytics-secret` | `replicate-analytics` CronJob | `PG_MAIN`, `PG_ANALYTICS` (`docia_<env>_analytics`), `LOKI_BEARER_TOKEN` | `REDIS`, `S3`, `OPENAI_API_KEY`, `PROCONNECT_*`, `PEPPERS` |
+| `docia-cron-dbt-secret` | `dbt-transform` CronJob | `PG_ANALYTICS` (`docia_<env>_analytics`), `LOKI_BEARER_TOKEN` | `PG_MAIN`, `REDIS`, `S3`, `OPENAI_API_KEY`, `PROCONNECT_*`, `PEPPERS` |
 | `docia-keda-redis-secret` | KEDA `TriggerAuthentication` (`docia-keda-redis-auth`) | `username`, `password`, `ca` (`DataStackSecrets.redis_ca_cert`) | All DBs, S3, Albert, ProConnect, Peppers, Loki |
 
 #### Intra-Stack Resource Dependency Graph (`stacks/apps`)
@@ -1291,12 +1300,13 @@ flowchart TB
     DEPLOY_EVALS["apps.v1.Deployment + Service ('document-ia-evals')<br/>(Streamlit Console + ProConnect OIDC)"]
     CRON_1["batch.v1.CronJob ('remove-ppi' - 03:00 UTC)"]
     CRON_2["batch.v1.CronJob ('replicate-analytics' - 05:00 UTC)"]
+    CRON_3["batch.v1.CronJob ('dbt-transform' - 05:30 UTC)"]
     ING_RULES["networking.v1.Ingress ('docia-ingress')<br/>(Traefik + cert-manager TLS 1.3: api.<env>.*, console.<env>.*)"]
 
     REFS --> K_PROV
     K_PROV --> K_SEC & NETPOL
     K_SEC & NETPOL --> DEPLOY_API
-    DEPLOY_API --> DEPLOY_WRK & DEPLOY_EVALS & CRON_1 & CRON_2
+    DEPLOY_API --> DEPLOY_WRK & DEPLOY_EVALS & CRON_1 & CRON_2 & CRON_3
     DEPLOY_WRK --> KEDA_SO
     DEPLOY_API & DEPLOY_EVALS --> ING_RULES
     ING_RULES & KEDA_SO --> OUT[["Export: AppsStackOutput<br/>(stack_data)"]]
