@@ -288,6 +288,74 @@ flowchart TD
 
 ## 4. Target Scaleway Cloud Architecture (Document IA Hosting)
 
+### 4.0. Big Picture — Global Cloud Architecture Overview
+
+This high-level view summarizes the complete request and data path from **Public Internet** users through the **public entry/egress gateways** into the **100 % private Scaleway VPC** and **regional managed services** (`fr-par`). Detailed deep-dive views follow in Sections 4.1–4.6.
+
+```mermaid
+flowchart LR
+    classDef internet fill:#e8f4fd,stroke:#1d6fa5,stroke-width:2px,color:#0d3b66
+    classDef gateway fill:#fff3cd,stroke:#d97706,stroke-width:2px,color:#78350f
+    classDef privateCompute fill:#e6f4ea,stroke:#1e7e34,stroke-width:2px,color:#14532d
+    classDef privateData fill:#f3e8ff,stroke:#7c3aed,stroke-width:2px,color:#4c1d95
+    classDef security fill:#fee2e2,stroke:#dc2626,stroke-width:2px,color:#7f1d1d
+    classDef scwService fill:#f1f5f9,stroke:#475569,stroke-width:2px,color:#1e293b
+
+    subgraph INBOUND["Internet (Entree)"]
+        USERS(["Utilisateurs & Clients API"]):::internet
+        DNS["DNS (OVH)"]:::internet
+    end
+
+    subgraph ENTRY["Points d'entree Publics"]
+        LB["Load Balancer Public<br/>(api.* · console.*)"]:::gateway
+        METABASE["Metabase BI<br/>(metabase.*)"]:::gateway
+    end
+
+    subgraph VPC["VPC Prive Scaleway — Zero IP Publique"]
+        subgraph PN_ENV["Reseau Prive Environnement"]
+            KAPSULE["Cluster Kubernetes Kapsule"]:::privateCompute
+            PG_MAIN[("PostgreSQL")]:::privateData
+            REDIS[("Redis")]:::privateData
+        end
+
+        VPC_ACL{{"VPC Network ACL (DROP par defaut)<br/>Autorise uniquement SQL vers Analytics"}}:::security
+
+        subgraph PN_ANA["Reseau Prive Analytics"]
+            PG_ANA[("PostgreSQL Analytics")]:::privateData
+        end
+    end
+
+    subgraph EGRESS["Sortie NAT & Bastion"]
+        PGW["Public Gateway<br/>(NAT Sortant · Bastion SSH)"]:::gateway
+    end
+
+    subgraph OUTBOUND["Destinations Sortantes"]
+        EXT["Services Externes<br/>(Albert · ProConnect · Webhooks)"]:::internet
+        S3[("Object Storage S3")]:::scwService
+        REG["Container Registry"]:::scwService
+        COCKPIT["Cockpit (Observabilite)"]:::scwService
+    end
+
+    USERS -->|"HTTPS"| DNS
+    DNS -->|"api.* / console.*"| LB
+    DNS -->|"metabase.*"| METABASE
+    LB --> KAPSULE
+    METABASE -->|"Reseau prive"| PG_ANA
+
+    KAPSULE --> PG_MAIN
+    KAPSULE --> REDIS
+    KAPSULE --> VPC_ACL
+    VPC_ACL --> PG_ANA
+
+    KAPSULE -->|"NAT"| PGW
+    PGW -->|"HTTPS"| EXT
+    PGW --> S3
+    PGW --> REG
+    PGW --> COCKPIT
+```
+
+---
+
 ### 4.1. Application Workloads & Data Stores Overview
 
 Document IA consists of **5 runtime workloads** built from hardened multi-stage Nix `FROM scratch` container images (running as UID `10001:10001` with read-only `/app`, `.venv`, and `.models/`), **1 BI Serverless Container** (`Metabase`), and **4 managed data/storage services**:
