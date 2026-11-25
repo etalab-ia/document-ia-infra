@@ -688,7 +688,7 @@ flowchart LR
     PGW --> COCKPIT
 ```
 
-#### 4.4.2. Intra-Cluster Isolation (Cilium `NetworkPolicy` per Workload in `docia-<env>`)
+#### 4.4.2. Intra-Cluster Isolation (Cilium `NetworkPolicy` & Role-Scoped Secrets in `docia-<env>`)
 
 ```mermaid
 flowchart LR
@@ -698,46 +698,37 @@ flowchart LR
     classDef data fill:#f3e8ff,stroke:#7c3aed,stroke-width:2px,color:#4c1d95
     classDef egress fill:#f1f5f9,stroke:#475569,stroke-width:2px,color:#1e293b
 
-    subgraph ENTRY["Ingress Cluster"]
-        LB["Scaleway LB<br/>TCP 80/443 + PPv2<br/>use-hostname=true"]:::ingress
-        TRAEFIK["Traefik + cert-manager<br/>trustedIPs: 172.16.x.0/22"]:::ingress
+    LB["Scaleway LB (Public)<br/>1 par cluster · TCP 80/443 · PPv2<br/>use-hostname=true"]:::ingress
+
+    subgraph KAPSULE["Cluster Kapsule du sous-reseau pn-&lt;env&gt;"]
+        TRAEFIK["Traefik + cert-manager<br/>(Namespace systeme du cluster)<br/>trustedIPs: 172.16.x.0/22"]:::ingress
+
+        subgraph NS["Namespace docia-&lt;env&gt; (Cilium Default-Deny + 7 Secrets dedies)"]
+            EVALS["Console: document-ia-evals (:8501)<br/>Secret: docia-evals-secret<br/>(Aucun acces DB / Redis)"]:::app
+            CORE["Core Runtime: API · Worker · KEDA<br/>Secrets: docia-api / worker / keda-redis<br/>(Aucun acces PG Analytics)"]:::app
+            CRON_PPI["CronJob: remove-ppi (03:00)<br/>Secret: docia-cron-ppi-secret"]:::cron
+            CRON_REPL["CronJob: replicate-analytics (05:00)<br/>Secret: docia-cron-analytics-secret"]:::cron
+            CRON_DBT["CronJob: dbt-transform (05:30)<br/>Secret: docia-cron-dbt-secret<br/>(Aucun acces PG Main)"]:::cron
+        end
     end
 
-    subgraph NS["Namespace docia-&lt;env&gt; (Cilium NetworkPolicy · Default-Deny)"]
-        EVALS["document-ia-evals (:8501)<br/>Secret: docia-evals-secret"]:::app
-        API["document-ia-api (:8000)<br/>Secret: docia-api-secret"]:::app
-        WORKER["document-ia-worker<br/>Secret: docia-worker-secret"]:::app
-        KEDA["KEDA Operator<br/>Secret: docia-keda-redis-secret"]:::app
-        CRON_PPI["CronJob: remove-ppi<br/>Secret: docia-cron-ppi-secret"]:::cron
-        CRON_REPL["CronJob: replicate-analytics<br/>Secret: docia-cron-analytics-secret"]:::cron
-        CRON_DBT["CronJob: dbt-transform<br/>Secret: docia-cron-dbt-secret"]:::cron
-    end
-
-    subgraph TARGETS["Destinations Autorisees (Privees & NAT Egress)"]
-        PG_MAIN[("PG Main (:5432)<br/>172.16.x.x")]:::data
-        REDIS[("Redis (:6379 TLS)<br/>172.16.x.x")]:::data
+    subgraph TARGETS["Destinations Autorisees (Loki :443 autorise pour tous)"]
+        NAT_EXT["NAT Egress (:443)<br/>ProConnect · S3 · Albert · Webhooks"]:::egress
+        REDIS[("Redis (:6379 TLS + CA)<br/>API · Worker · KEDA")]:::data
+        PG_MAIN[("PG Main (:5432)<br/>API · Worker · PPI · Replicate")]:::data
         PG_ANA[("PG Analytics (:5432)<br/>172.16.0.10/32")]:::data
-        EGRESS_APP["NAT Egress (:443)<br/>S3 · Albert · ProConnect<br/>Webhooks · Cockpit Loki"]:::egress
     end
 
-    %% Ingress routing
     LB -->|"PPv2"| TRAEFIK
     TRAEFIK -->|"console.*"| EVALS
-    TRAEFIK -->|"api.*"| API
+    TRAEFIK -->|"api.*"| CORE
 
-    %% Allowed East-West pod flows
-    EVALS -->|"HTTP :8000"| API
-    EVALS -->|"ProConnect / Loki"| EGRESS_APP
+    EVALS -->|"HTTP :8000"| CORE
+    EVALS -->|"ProConnect :443"| NAT_EXT
 
-    API -->|"SQL :5432"| PG_MAIN
-    API -->|"TLS :6379"| REDIS
-    API -->|"S3 / Webhooks / Loki"| EGRESS_APP
-
-    WORKER -->|"SQL :5432"| PG_MAIN
-    WORKER -->|"TLS :6379"| REDIS
-    WORKER -->|"S3 / Albert / Loki"| EGRESS_APP
-
-    KEDA -->|"TLS + CA :6379"| REDIS
+    CORE -->|"S3 / Albert / Webhooks"| NAT_EXT
+    CORE -->|"TLS :6379"| REDIS
+    CORE -->|"SQL :5432"| PG_MAIN
 
     CRON_PPI -->|"SQL :5432"| PG_MAIN
     CRON_REPL -->|"Read :5432"| PG_MAIN
