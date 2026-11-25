@@ -119,20 +119,20 @@ sequenceDiagram
 ### ADR-006: Multi-Stack Layout & Shared Typed Library (`lib/infra_lib`)
 
 * **Decision**: Organize infrastructure into **7 layered, independent Pulumi projects** under `stacks/<name>/` sharing a common editable Python package `lib/infra_lib/`:
-  * **Layer 0 — `stacks/base` (`env=shared`)**: Project-wide shared foundation unique to Scaleway project `DocumentIA`: **Shared Regional VPC** (`enable_routing=True`) with **VPC Network ACL** (`default_policy="drop"` allowing only `pn-<env> -> pn-analytics:5432` + return traffic), Scaleway Cockpit activation, and shared private Container Registry (+ CI push IAM App).
+  * **Layer 0 — `stacks/base` (`env=shared`)**: Project-wide shared foundation unique to Scaleway project `DocumentIA`: **Shared Regional VPC** (`enable_routing=True`) with **VPC Network ACL** (`default_policy="drop"` allowing only `pn-<env> -> <analytics_db_private_ip>/32:5432` + return traffic, strictly pinned to the `/32` host IP of `docia-shared-pg-analytics`), Scaleway Cockpit activation, and shared private Container Registry (+ CI push IAM App).
   * **Layer 1A — `stacks/network` (per network boundary)**: Isolated `PrivateNetwork` (dedicated non-overlapping CIDR inside the shared VPC), Public Gateway (NAT + static egress IP + SSH Bastion), Reserved Ingress Load Balancer IP, and scoped Cockpit logging token.
   * **Layer 1B — `stacks/analytics` (`env=shared`)**: Dedicated `pn-analytics` Private Network inside the shared VPC, **100 % private** Shared Analytics PostgreSQL RDB (zero public IP), schema-scoped roles/grants via `pulumi-postgresql`, and **Metabase** hosted as a **Scaleway Serverless Container** (`min_scale=1`, attached to `pn-analytics`) with managed TLS custom domain.
   * **Layer 1C — `stacks/observability` (`env=shared`)**: Declarative observability-as-code on Scaleway Cockpit — versioned Grafana dashboards provisioned via `pulumiverse-grafana` (IAM `X-Auth-Token`), `scaleway.observability.AlertManager` (preconfigured infra alerts + contact points), and versioned custom Loki/Mimir alerting rules.
-  * **Layer 2 — `stacks/data` (always per environment: `staging`, `sandbox`, `prod`)**: Dedicated S3 Documents bucket (7-day lifecycle + scoped IAM App + S3 Bucket Policy), Main PostgreSQL RDB (private only), Managed Redis 7+ (`noeviction`, private only), and environment Secret Manager bundle.
+  * **Layer 2 — `stacks/data` (always per environment: `staging`, `sandbox`, `prod`)**: Dedicated S3 Documents bucket (7-day lifecycle + policy-less IAM App + S3 Bucket Policy), Main PostgreSQL RDB (private only), and Managed Redis 7+ (`noeviction`, private only), exporting non-sensitive coordinates in `stack_data` and generated credentials in encrypted `stack_secrets`.
   * **Layer 3 — `stacks/cluster` (per Kubernetes cluster)**: Scaleway Kapsule cluster (`cni="cilium"`), private Node Pools (`api-system`, `workers`), **Traefik** bound to the reserved LB IP via Scaleway CCM (TCP L4 + Proxy Protocol v2), **`cert-manager`** (Let's Encrypt HTTP-01), KEDA Operator, and Kubernetes Namespaces.
-  * **Layer 4 — `stacks/apps` (always per environment: `staging`, `sandbox`, `prod`)**: Application Kubernetes workloads (`document-ia-api`, `document-ia-worker`, `document-ia-evals` exposed on `console.*`, 2 `CronJob`s, KEDA `ScaledObject`, Cilium `NetworkPolicy`, `Ingress` with automated TLS, and `v1.Secret` materialized by Pulumi from Secret Manager).
+  * **Layer 4 — `stacks/apps` (always per environment: `staging`, `sandbox`, `prod`)**: Application Kubernetes workloads (`document-ia-api`, `document-ia-worker`, `document-ia-evals` exposed on `console.*`, 2 `CronJob`s, KEDA `ScaledObject`, Cilium `NetworkPolicy`, `Ingress` with automated TLS, and **least-privilege role-scoped `core.v1.Secret`s per workload** built from upstream encrypted `stack_secrets` + external secrets stored via `pulumi config set --secret` in `stacks/apps/Pulumi.<env>.yaml`).
 * **Rationale**:
   * **Strict lifecycle separation**: Decoupling slow-changing cluster infrastructure (`stacks/cluster`) from fast-moving application releases (`stacks/apps`) and separating dashboards/alerts (`stacks/observability`) from critical networking (`stacks/base`) keeps blast radius minimal—tweaking a Grafana panel or alert threshold never touches the shared VPC or ACLs.
   * **Zero public IP on any database & clean DAG**: Putting the shared VPC + default-deny VPC Network ACL in `stacks/base` allows `stacks/network` (Layer 1A) and `stacks/analytics` (Layer 1B) to deploy independently in parallel, keeps 100 % of analytics replication traffic inside private RFC 1918 networks, and decouples Metabase completely from Kubernetes clusters.
   * **No Scaleway project-level resource conflicts**: Scaleway Cockpit is unique per Scaleway project and OCI images (~1.5 GiB worker images) should be built once and promoted by immutable digest across environments; placing them in `stacks/base` (`env=shared`) prevents state collisions and image duplication.
   * **Topology flexibility without code duplication**: Separating `network` and `cluster` from `data` and `apps` enables both a **fully symmetric topology** (1 cluster per environment) and a **2-cluster topology** (`non-prod` shared by `staging` + `sandbox`, `prod` dedicated) using the exact same `stacks/data` and `stacks/apps` code (see [ADR-012](#adr-012-environment-isolation-topologies-symmetric-vs-2-cluster-non-prod--prod)).
   * **Consistent naming & tagging in a single Scaleway project**: `InfraContext.resource_name(component)` (`docia-<env>-<component>`) and `InfraContext.default_tags()` prevent resource name collisions across environments inside the shared `DocumentIA` project.
-  * **Typed cross-stack contracts**: Each stack exports a structured `stack_data` `TypedDict` (via `outputs.py`) consumed by downstream stacks through `infra_lib.get_stack_data(project_name, env)` (which uses `organization/<project_name>/<env>` as required by self-managed S3 backends).
+  * **Typed cross-stack contracts (`stack_data` + `stack_secrets`)**: Each stack exports a non-sensitive `stack_data` `TypedDict` (via `outputs.py`, readable in plain text during `pulumi preview`) and, when it generates credentials, a separate encrypted `stack_secrets` output (`pulumi.Output.secret(...)`), consumed by downstream stacks via `infra_lib.get_stack_data(...)` / `infra_lib.get_stack_secrets(...)` (`organization/<project_name>/<env>`).
 
 ```mermaid
 flowchart TD
@@ -142,21 +142,22 @@ flowchart TD
     NET["Layer 1A: stacks/network (per topology)<br/>Private Network (isolated CIDR), Public Gateway (NAT/Bastion),<br/>Reserved LB IP, Scoped Cockpit Token"]
     ANALYTICS["Layer 1B: stacks/analytics (env=shared)<br/>pn-analytics, Private Analytics PG 16 (zero public IP),<br/>Schemas & Roles (pulumi-postgresql),<br/>Metabase Serverless Container (TLS Custom Domain)"]
     OBS["Layer 1C: stacks/observability (env=shared)<br/>Grafana Dashboards (pulumiverse-grafana JSON),<br/>Cockpit AlertManager & Custom Loki/Mimir Rules"]
-    DATA["Layer 2: stacks/data (per env)<br/>S3 Bucket (7d Lifecycle + IAM App + Bucket Policy),<br/>Main PostgreSQL RDB, Managed Redis 7+ (noeviction),<br/>App Secrets"]
+    DATA["Layer 2: stacks/data (per env)<br/>S3 Bucket (7d Lifecycle + IAM App + Bucket Policy),<br/>Main PostgreSQL RDB, Managed Redis 7+ (noeviction)"]
     CLUSTER["Layer 3: stacks/cluster (per topology)<br/>Kapsule Private Cluster (Cilium), Node Pools,<br/>Traefik (LB via CCM) + cert-manager, KEDA, Namespaces"]
-    APPS["Layer 4: stacks/apps (per env)<br/>v1.Secret (Pulumi), NetworkPolicies, API, Worker,<br/>KEDA ScaledObject, Console/Evals (ProConnect), 2 CronJobs,<br/>Ingress (Automated TLS)"]
+    APPS["Layer 4: stacks/apps (per env)<br/>Role-Scoped v1.Secrets (Pulumi), NetworkPolicies, API, Worker,<br/>KEDA ScaledObject, Console/Evals (ProConnect), 2 CronJobs,<br/>Ingress (Automated TLS)"]
 
     LIB --> TEST & BASE & NET & ANALYTICS & OBS & DATA & CLUSTER & APPS
     BASE -->|"vpc_id, subnet_cidrs, cockpit_loki_url"| NET
-    BASE -->|"vpc_id, analytics_subnet_cidr"| ANALYTICS
+    BASE -->|"vpc_id, analytics_subnet_cidr, analytics_db_private_ip"| ANALYTICS
     BASE -->|"cockpit_grafana_url, cockpit_loki_url"| OBS
     BASE -->|"registry_endpoint"| APPS
     NET -->|"private_network_id"| DATA
     NET -->|"private_network_id, lb_reserved_ip_id, lb_public_ip"| CLUSTER
-    NET -->|"cockpit_token_secret_id"| APPS
+    NET -->|"stack_secrets (cockpit_loki_token)"| APPS
     ANALYTICS -->|"analytics_db_private_host, env_schemas[env]"| DATA
-    DATA -->|"main_db, redis, s3, analytics_private_host, runtime_secrets_id"| APPS
-    CLUSTER -->|"kubeconfig_secret_id, namespace, ingress_class, cert_issuer"| APPS
+    ANALYTICS -->|"stack_secrets (analytics_db_creds[env])"| APPS
+    DATA -->|"main_db, redis, s3 + stack_secrets (creds)"| APPS
+    CLUSTER -->|"namespace, ingress_class, cert_issuer + stack_secrets (kubeconfig)"| APPS
 ```
 
 ### ADR-007: Scaleway Kubernetes Kapsule with Private Node Pools, Separated Cluster/App Stacks & Traefik + `cert-manager` Ingress
@@ -164,38 +165,39 @@ flowchart TD
 * **Decision**: Run all Document IA application workloads (`api`, `worker`, `evals`, `CronJob`s) on **Scaleway Kubernetes Kapsule** using **100% private Node Pools** (`public_ip_disabled=True`) attached to their environment's `PrivateNetwork`, fronted by a **single Scaleway Load Balancer** per cluster in **TCP L4 (Proxy Protocol v2)** mode feeding **Traefik** + **`cert-manager`**, split across `stacks/cluster` (cluster + operators) and `stacks/apps` (workloads).
 * **Rationale**:
   * **Strict network perimeter**: Compute nodes have zero public IPv4/IPv6 addresses and cannot be reached directly from the Internet.
-  * **Single HTTPS entry point (no duplicate LB, future-proof Ingress)**: `stacks/network` reserves a static `scaleway.loadbalancers.Ip`. In `stacks/cluster`, **Traefik** (replacing upstream `ingress-nginx`, which reached EOL in early 2026, and natively supporting both `Ingress` and Kubernetes Gateway API) is installed with Scaleway CCM annotations binding its `LoadBalancer` Service directly to that reserved IP over the `PrivateNetwork` with Proxy Protocol v2 enabled (`scw-loadbalancer-proxy-protocol-v2: "true"`). **`cert-manager`** terminates TLS 1.3 with automated Let's Encrypt HTTP-01 certificates for Host-based routing:
+  * **Single HTTPS entry point (no duplicate LB, future-proof Ingress)**: `stacks/network` reserves a static `scaleway.loadbalancers.Ip`. In `stacks/cluster`, **Traefik** (replacing upstream `ingress-nginx`, which reached EOL in early 2026, and natively supporting both `Ingress` and Kubernetes Gateway API) is installed with Scaleway CCM annotations binding its `LoadBalancer` Service directly to that reserved IP over the `PrivateNetwork` with Proxy Protocol v2 enabled (`scw-loadbalancer-proxy-protocol-v2: "true"`), **`service.beta.kubernetes.io/scw-loadbalancer-use-hostname: "true"`** (mandatory to prevent Cilium/`kube-proxy` from short-circuiting in-cluster traffic like `cert-manager` HTTP-01 self-checks directly to Traefik without Proxy Protocol v2 headers), and Traefik `entryPoints.{web,websecure}.proxyProtocol.trustedIPs` restricted to the boundary's `PrivateNetwork` CIDR (`172.16.x.0/22`). **`cert-manager`** terminates TLS 1.3 with automated Let's Encrypt HTTP-01 certificates for Host-based routing:
     * `api.<env>.*` (prod: `api.*`) $\rightarrow$ `document-ia-api` (FastAPI REST API).
     * `console.<env>.*` (prod: `console.*`) $\rightarrow$ `document-ia-evals` (Streamlit evaluation console, authenticated via **ProConnect** OIDC).
   * **Native Kubernetes CronJobs & NetworkPolicies**: Replaces custom PaaS schedulers with native Kubernetes `CronJob` resources (`remove-ppi`, `replicate-analytics`) and **Cilium `NetworkPolicy`** rules providing defense-in-depth against SSRF lateral movement and cross-environment isolation.
-  * **Kubernetes Secrets managed in `stacks/apps`**: For simplicity in the initial architecture, `stacks/apps` reads the environment secret bundle from Scaleway Secret Manager and materializes the Kubernetes `v1.Secret` directly via Pulumi (encrypted in the Pulumi S3 state). *(Migrating to External Secrets Operator remains a non-breaking future evolution if automated secret rotation without `pulumi up` is needed later).*
+  * **Least-Privilege Role-Scoped Kubernetes Secrets in `stacks/apps`**: Rather than mounting a monolithic secret across every pod (or placing plaintext credentials in `Deployment` `env:` specs), `stacks/apps` reads infra-generated credentials from upstream encrypted Pulumi `stack_secrets` outputs (`stacks/data`, `stacks/analytics`, `stacks/network`) and external application secrets from `pulumi config set --secret` (`stacks/apps/Pulumi.<env>.yaml`), then materializes **dedicated `core.v1.Secret` objects per workload role** (`docia-api-secret`, `docia-worker-secret`, `docia-evals-secret`, `docia-cron-ppi-secret`, `docia-cron-analytics-secret`). Each pod only mounts the exact credentials it requires via `envFrom: secretRef`. *(Migrating to External Secrets Operator remains a non-breaking future evolution if automated secret rotation without `pulumi up` is needed later).*
 * **Alternatives rejected**:
   * *Scaleway Serverless Containers for API/Worker*: Cold-start and RAM/disk constraints with the ~418 MiB pre-bundled AI/OCR models (`yolov8m-world.pt`, `ViT-B-32.pt`, `qrdet-s.pt`, `fra.traineddata`) and Redis Streams KEDA worker pooling. *(Note: Serverless Containers ARE an ideal fit for the stateless Metabase BI container—see [ADR-009](#adr-009-shared-private-analytics-postgresql--metabase-serverless-container-stacksanalytics)).*
   * *Raw Scaleway Instances (VMs)*: Requires custom tooling for rolling deployments, health probing, cron orchestration, and node auto-scaling.
 
 ### ADR-008: Scaleway Public Gateway (NAT Egress & SSH Bastion) for Private Compute Nodes
 
-* **Decision**: Attach a **Scaleway Public Gateway** (`scaleway.vpcgw.Gateway` + `GatewayNetwork` with `enable_masquerade=True`, SSH Bastion support, and a reserved static `vpcgw.Ip`) to each compute `PrivateNetwork` in `stacks/network`.
+* **Decision**: Attach a **Scaleway Public Gateway** (`scaleway.vpcgw.Gateway` + `GatewayNetwork` with `enable_masquerade=True`, configurable SSH Bastion support, and a reserved static `vpcgw.Ip`) to each compute `PrivateNetwork` in `stacks/network`, enforcing a **break-glass SSH Bastion policy in `prod`** (`bastion_enabled=False` by default in `prod`; `bastion_enabled=True` in `staging`/`sandbox`/`non-prod`) and supporting `bastion_allowed_ips` IP allowlisting whenever the bastion is enabled.
 * **Rationale**:
   * On Scaleway, **Managed PostgreSQL (RDB)** (both per-env Main DB and Shared Analytics DB via VPC Routing) and **Managed Redis** attach directly to `PrivateNetwork`s with private RFC 1918 IPs (`172.16.x.x`) and are accessed directly over L2/L3 without traversing any Public Gateway.
   * Conversely, **regional Scaleway services**—including **Scaleway Object Storage (`s3.fr-par.scw.cloud`)**, **Scaleway Container Registry (`rg.fr-par.scw.cloud`)**, **Scaleway Cockpit (`logs.cockpit.fr-par.scw.cloud`)**, and **Scaleway Secret Manager**—do not provide private VPC Endpoint IPs; their DNS names resolve to Scaleway public IPs.
   * Because Kapsule nodes have `public_ip_disabled=True`, any outbound packet addressed outside the VPC CIDR requires an L3 NAT default gateway (**Scaleway Public Gateway**):
     1. **Intra-Scaleway regional traffic** (S3 document uploads/downloads, container image pulls, Loki log pushes) is NATed by the Public Gateway while remaining physically on the internal Scaleway `fr-par` backbone.
     2. **External Internet egress** is routed through the static Public Gateway IP to reach **Albert API** (`https://albert.api.etalab.gouv.fr/v1`) for OCR/LLM calls, external document download URLs (`file_url` protected by `SafeAsyncHTTPTransport` anti-SSRF socket pinning), customer **Webhook** endpoints, and **ProConnect** OIDC endpoints.
-    3. Having a **static egress IP** allows partner webhook receivers and Albert API to whitelist Document IA's outbound traffic deterministically, while the built-in **SSH Bastion** enables authenticated operator/CI tunneling to private VPC databases (such as running `pulumi-postgresql` against the private Analytics RDB) without exposing public DB endpoints.
+    3. Having a **static egress IP** allows partner webhook receivers and Albert API to whitelist Document IA's outbound traffic deterministically, while the built-in **managed SSH Bastion** (TCP port-forwarding relay on port `61000`, no shell) enables authenticated operator/CI tunneling (`ssh -N -L ...`) to private VPC databases without exposing public DB endpoints.
+  * **Break-glass security in `prod`**: Because Scaleway's Public Gateway Bastion accepts all SSH keys registered in the shared `DocumentIA` project and defaults to `0.0.0.0/0` if `bastion_allowed_ips` is omitted, **`prod` keeps `bastion_enabled=False` by default** (zero SSH attack surface 99.9% of the time). For emergency production DB debugging, an operator temporarily enables it via Pulumi config (`bastion_enabled=true` + operator/VPN CIDR in `bastion_allowed_ips`), runs `make up stack=network env=prod`, completes the intervention, and disables it immediately afterward. Routine `stacks/analytics` (`pulumi-postgresql`) tunneling uses the non-prod/staging Bastion.
 
 ### ADR-009: Shared Private Analytics PostgreSQL & Metabase Serverless Container (`stacks/analytics`)
 
 * **Decision**:
-  1. **100 % Private Multi-Environment Connectivity (Option R1)**: Place all `PrivateNetwork`s inside a **single shared Regional VPC** (`docia-shared-vpc`, declared in `stacks/base` with Scaleway **VPC Routing** enabled) protected by a **default-deny VPC Network ACL** (`scaleway.network.Acl`, `default_policy="drop"`). Provision a dedicated `pn-analytics` (`172.16.0.0/24`) in `stacks/analytics` and attach the shared PostgreSQL Analytics RDB (`docia-shared-pg-analytics`) **exclusively to `pn-analytics`** (zero public IP / empty public ACL).
+  1. **100 % Private Multi-Environment Connectivity with `/32`-Pinned VPC ACL (Option R1)**: Place all `PrivateNetwork`s inside a **single shared Regional VPC** (`docia-shared-vpc`, declared in `stacks/base` with Scaleway **VPC Routing** enabled) protected by a **default-deny VPC Network ACL** (`scaleway.network.Acl`, `default_policy="drop"`). Provision a dedicated `pn-analytics` (`172.16.0.0/24`) in `stacks/analytics` and attach the shared PostgreSQL Analytics RDB (`docia-shared-pg-analytics`) **exclusively to `pn-analytics`** (zero public IP / empty public ACL) using a **deterministic static private IP** (`analytics_db_private_ip`, e.g., `172.16.0.10/32`, exported from `stacks/base` and assigned via `ip_net` / IPAM reservation).
   2. **Schema-Level RBAC via `pulumi-postgresql`**: Use the **`pulumi-postgresql`** provider to declaratively manage per-environment schemas (`staging`, `sandbox`, `prod`) and least-privilege schema grants (`metabase` RW `public` + RO env schemas; `docia_<env>_analytics` RW strictly on its own `<env>` schema).
   3. **Decoupled Metabase Hosting on Scaleway Serverless Containers (Option M1)**: Deploy **Metabase** directly inside `stacks/analytics` as a **Scaleway Serverless Container** (`min_scale=1`, `max_scale=1`, 2–4 GiB RAM) attached to `pn-analytics`, with a managed TLS Let's Encrypt custom domain (`metabase.document-ia.beta.gouv.fr`).
 * **Rationale**:
-  * **Zero public database exposure**: Every database in Document IA (all per-env Main RDBs AND the Shared Analytics RDB) is 100 % private on RFC 1918 IPs. Scaleway's VPC vRouter routes `pn-<env>` $\rightarrow$ `pn-analytics:5432` privately while the stateless VPC Network ACL (`default_policy="drop"`) guarantees that **zero cross-environment traffic** is ever allowed between `pn-staging`, `pn-sandbox`, and `pn-prod`.
-  * **Stateless VPC Network ACL rules**: Because Scaleway VPC ACLs are stateless, `stacks/base` explicitly pairs each inbound rule (`pn-<env> -> pn-analytics:5432`) with its matching return rule (`pn-analytics:5432 -> pn-<env>:1024-65535`).
+  * **Zero public database exposure**: Every database in Document IA (all per-env Main RDBs AND the Shared Analytics RDB) is 100 % private on RFC 1918 IPs. Scaleway's VPC vRouter routes `pn-<env>` $\rightarrow$ `172.16.0.10/32:5432` privately while the stateless VPC Network ACL (`default_policy="drop"`) guarantees that **zero cross-environment traffic** is ever allowed between `pn-staging`, `pn-sandbox`, and `pn-prod`.
+  * **Stateless VPC Network ACL hardened to `/32` (anti-source-port-5432 bypass)**: Because Scaleway VPC ACLs are stateless, `stacks/base` explicitly pairs each inbound rule (`pn-<env> -> 172.16.0.10/32:5432`) with its matching return rule (`172.16.0.10/32:5432 -> pn-<env>:1024-65535`). **Pinning the rule to the exact `/32` IP of `docia-shared-pg-analytics` (rather than the entire `172.16.0.0/24` subnet) is mandatory**: because port `5432` is unprivileged (`> 1024`), a subnet-wide `/24` return rule would allow a compromised Metabase container sharing `pn-analytics` to bind local source port `5432` and initiate outbound TCP connections to `pn-prod` (`pg-main:5432`, `redis:6379`, Kubelet). With `/32` pinning, Metabase communicates locally over L2 with `172.16.0.10:5432` inside `pn-analytics`, while any packet from Metabase's own IP toward `pn-prod` / non-prod PNs is unconditionally dropped by the VPC vRouter.
   * **Complete decoupling of Metabase from Kapsule**: Metabase is 100 % stateless (all dashboards, users, and metadata live in PostgreSQL schema `public`). Running it as an always-on Serverless Container (`min_scale=1` to eliminate JVM cold starts) avoids coupling internal BI availability or attack surface to the `prod` (or `non-prod`) Kubernetes cluster, avoids any extra Load Balancer or cluster cost, and keeps the entire Analytics + BI stack self-contained in `stacks/analytics` with zero circular dependencies.
   * **Schema-level RBAC via `pulumi-postgresql`**: Scaleway's native `scaleway.databases.Privilege` only grants database-level rights. Using `pulumi-postgresql` (`postgresql.Schema`, `postgresql.Role`, `postgresql.Grant`, `postgresql.DefaultPrivileges`) enforces strict per-schema isolation.
-  * *Operational note (`pulumi-postgresql` on a 100 % private DB)*: Because `docia-shared-pg-analytics` has no public endpoint, applying schema/role changes in `stacks/analytics` connects via an **SSH tunnel through a Scaleway Public Gateway Bastion** (which already belongs to a `pn-<env>` permitted by the VPC ACL to reach `pn-analytics:5432`) or via a private VPC CI runner.
+  * *Operational note (`pulumi-postgresql` on a 100 % private DB via `Makefile` SSH tunnel)*: Because `docia-shared-pg-analytics` has no public endpoint, `make preview`/`make up` on `stacks/analytics` wraps Pulumi in a thin `Makefile` helper (`scripts/with_analytics_tunnel.sh`) using an SSH ControlSocket (`ssh -M -S <sock> -f -N -o ExitOnForwardFailure=yes -L 15432:172.16.0.10:5432 bastion@<nonprod_pgw_ip> -p 61000`) with a `trap 'ssh -S <sock> -O exit ...' EXIT` cleanup. Because `172.16.0.10` is deterministic (from `stacks/base`) and SSH `-L` dials the remote target lazily only when `pulumi-postgresql` connects (after Scaleway finishes provisioning the RDB), this works cleanly on the very first `make up stack=analytics env=shared` (provided at least one non-prod/staging `stacks/network` Bastion is deployed first). Inside a private VPC CI runner, `pulumi-postgresql` connects directly to `172.16.0.10:5432` without a tunnel.
 
 ### ADR-010: Event-Driven Worker Auto-Scaling with KEDA on Redis Streams (`lagCount` + HPA Cooldowns)
 
@@ -204,7 +206,7 @@ flowchart TD
   * Replaces the legacy `document-ia-auto-scaler` daemon (which was built around the Scalingo REST API because Scalingo lacked Redis queue-based auto-scaling) with a native Kubernetes controller requiring zero custom daemon code.
   * **Exact metric parity**: Uses KEDA's `lagCount` parameter (`XINFO GROUPS` consumer group lag = `nb_execution_undelivered`, excluding already in-flight PEL entries), matching the exact signal previously read from `/api/v1/health`.
   * **Anti-flapping cooldowns (`minReplicaCount >= 1`)**: Because KEDA's `spec.cooldownPeriod` only governs `1 -> 0` scale-to-zero transitions, anti-oscillation between `N -> minReplicaCount` is enforced via Kubernetes HPA `behavior` rules (`scaleUp`: max `+1 Pod / 120s` with `30s` stabilization; `scaleDown`: `300s` stabilization window + max `-1 Pod / 300s`).
-  * **Graceful drain on scale-down**: `document-ia-worker` sets `terminationGracePeriodSeconds: 180` (vs. Kubernetes' 30s default) so in-flight OCR/Albert threads finish cleanly and `XACK` before pod termination.
+  * **Graceful drain & zero-loss reclaim on scale-down**: `document-ia-worker` sets `terminationGracePeriodSeconds: 180` (vs. Kubernetes' 30s default) so in-flight OCR/Albert threads finish cleanly and `XACK` before pod termination, backed by already-tested graceful shutdown and Redis Streams `XAUTOCLAIM` reclaim logic inside `document-ia-worker` to guarantee zero data loss on scale-down or unexpected pod restarts.
   * KEDA's operator is provisioned in `stacks/cluster`, while each environment's `ScaledObject` lives alongside `document-ia-worker` in `stacks/apps` (see [Section 4.6](#46-event-driven-worker-auto-scaling-keda--hpa--kapsule-cluster-autoscaler)).
 
 ### ADR-011: Shared Private Scaleway Container Registry, Project-Level Cockpit & Observability-as-Code (`stacks/base` + `stacks/observability`)
@@ -294,7 +296,7 @@ classDiagram
     class DocumentIA_API {
         +Image: document-ia-api
         +Runtime: FastAPI (Gunicorn + Uvicorn :8000)
-        +Startup: Alembic auto_migrate() & auto_migrate_analytics()
+        +Startup: Alembic auto_migrate() (Main DB only)
         +Background: AsyncIoConsumer (webhook_stream)
         +Admission: Redis Lua quota & backlog hysteresis
     }
@@ -321,6 +323,7 @@ classDiagram
         +Image: document-ia-worker (--target replicate_analytics)
         +Schedule: 0 5 * * * (Daily 05:00 UTC)
         +Sizing: Large (Scalingo L equivalent)
+        +Startup: Alembic auto_migrate_analytics() on schema=<env>
         +Action: Incremental anonymized upsert to Analytics DB (schema=<env>)
     }
     class Metabase_BI {
@@ -362,7 +365,7 @@ flowchart TB
     end
 
     subgraph SHARED_VPC["Shared Regional VPC (docia-shared-vpc — VPC Routing Enabled + Default-Deny VPC Network ACL)"]
-        VPC_ACL["VPC Network ACL (default_policy=DROP)<br/>Allows ONLY: pn-&lt;env&gt; -> pn-analytics:5432 (+ return)<br/>Blocks ALL cross-env traffic"]
+        VPC_ACL["VPC Network ACL (default_policy=DROP)<br/>Allows ONLY: pn-&lt;env&gt; -> pg-analytics (172.16.0.10/32:5432) (+ return)<br/>Blocks ALL cross-env & Metabase -> env traffic"]
 
         subgraph ENV_PN["stacks/network — Environment Private Network (172.16.x.0/22 — ZERO PUBLIC IP ON NODES & DATA)"]
             LB["Scaleway Load Balancer (Single Public Ingress)<br/>Managed by Traefik CCM on Reserved IP - TCP L4 + Proxy Protocol v2"]
@@ -410,8 +413,8 @@ flowchart TB
     CRON_PPI -->|"Anonymize J+7 Payloads (5432)"| PG_MAIN
     CRON_REPL -->|"1. Incremental Read (5432)"| PG_MAIN
 
-    %% Private VPC-Routed Analytics Traffic (Zero Public IP)
-    API & CRON_REPL -->|"Private VPC Route (5432)"| VPC_ACL
+    %% Private VPC-Routed Analytics Traffic (Zero Public IP — replicate-analytics CronJob ONLY)
+    CRON_REPL -->|"Private VPC Route (5432)"| VPC_ACL
     VPC_ACL -->|"Allowed TCP 5432"| PG_ANALYTICS
     METABASE -->|"Private SQL on pn-analytics (5432)"| PG_ANALYTICS
 
@@ -516,7 +519,7 @@ flowchart TB
 ```
 
 > [!NOTE]
-> In **Topology B**, Cilium `NetworkPolicy` rules strictly isolate `docia-staging` and `docia-sandbox`: pods in `docia-staging` can only connect to `pg-main-staging`, `redis-staging`, and `pn-analytics:5432` (never to `sandbox` pods or `sandbox` databases), and vice versa. In both topologies, the **VPC Network ACL (`default_policy="drop"`)** prevents any packet from crossing between `pn-prod` and non-prod Private Networks.
+> In **Topology B**, Cilium `NetworkPolicy` rules strictly isolate `docia-staging` and `docia-sandbox`: pods in `docia-staging` can only connect to `pg-main-staging`, `redis-staging`, and `pg-analytics` (`172.16.0.10/32:5432`) (never to `sandbox` pods or `sandbox` databases), and vice versa. In both topologies, the **VPC Network ACL (`default_policy="drop"`)** prevents any packet from crossing between `pn-prod` and non-prod Private Networks.
 
 ---
 
@@ -525,12 +528,12 @@ flowchart TB
 | Source Component | Allowed Private Network Destinations | Allowed Outbound Egress (via Public Gateway NAT) | Blocked by VPC ACL, Application & Cilium `NetworkPolicy` |
 |---|---|---|---|
 | **Scaleway Load Balancer** | **Traefik** Controller (TCP 80/443 + Proxy Protocol v2) | *None* | Direct access to PostgreSQL, Redis, or Worker pods |
-| **`document-ia-api`** | Own env `PostgreSQL Main (:5432)`, Own env `Redis (:6379)`, Shared Analytics RDB (`pn-analytics:5432`), `CoreDNS (:53)` | Scaleway S3, Cockpit Loki, Customer Webhook HTTPS endpoints (`:443`) | Any pod in another namespace (Topology B), other env PNs (VPC ACL), Worker or Evals pods |
+| **`document-ia-api`** | Own env `PostgreSQL Main (:5432)`, Own env `Redis (:6379)`, `CoreDNS (:53)` | Scaleway S3, Cockpit Loki, Customer Webhook HTTPS endpoints (`:443`) | Shared Analytics RDB (`pn-analytics`), any pod in another namespace (Topology B), other env PNs (VPC ACL), Worker or Evals pods |
 | **`document-ia-worker`** | Own env `PostgreSQL Main (:5432)`, Own env `Redis (:6379)`, `CoreDNS (:53)` | Scaleway S3, Albert API (`:443`), External `file_url` (`:443` filtered by `SafeAsyncHTTPTransport`), Cockpit Loki | All RFC 1918 (`10/8`, `172.16/12`, `192.168/16`) including `pn-analytics`, CGNAT (`100.64/10`), Link-Local (`169.254/16`), API pods, other env data stores |
 | **`document-ia-evals`** | Own env `document-ia-api (:8000)`, `CoreDNS (:53)` | ProConnect OIDC (`:443`), Scaleway S3, Cockpit Loki | Direct access to PostgreSQL Main, Analytics DB, or Redis |
 | **`remove-ppi` CronJob** | Own env `PostgreSQL Main (:5432)`, `CoreDNS (:53)` | Cockpit Loki (`:443`) | All external Internet, S3, Redis, Analytics DB |
-| **`replicate-analytics` CronJob** | Own env `PostgreSQL Main (:5432)`, Shared Analytics RDB (`pn-analytics:5432`), `CoreDNS (:53)` | Cockpit Loki (`:443`) | S3, Redis, arbitrary external hosts, other env PNs |
-| **Metabase Serverless Container** | Shared Analytics RDB on `pn-analytics (:5432)` | Managed outbound HTTPS (e.g. SMTP / OIDC if configured) | All compute PNs (`pn-staging`, `pn-sandbox`, `pn-non-prod`, `pn-prod`) — blocked by VPC ACL `default_policy=drop` |
+| **`replicate-analytics` CronJob** | Own env `PostgreSQL Main (:5432)`, Shared Analytics RDB (`172.16.0.10/32:5432`), `CoreDNS (:53)` | Cockpit Loki (`:443`) | S3, Redis, arbitrary external hosts, other env PNs |
+| **Metabase Serverless Container** | Shared Analytics RDB on `pn-analytics` (`172.16.0.10/32:5432`, local L2) | Managed outbound HTTPS (e.g. SMTP / OIDC if configured) | All compute PNs (`pn-staging`, `pn-sandbox`, `pn-non-prod`, `pn-prod`) — blocked by `/32`-pinned VPC ACL (`default_policy=drop`: only `172.16.0.10/32:5432` can reply to compute PNs, never Metabase's IP) |
 
 ---
 
@@ -541,12 +544,12 @@ To preserve the multi-environment analytics design with **zero public IP on the 
 ```mermaid
 flowchart LR
     subgraph ENVS["Document IA Environments (Inside Shared VPC — Private RFC 1918 Traffic)"]
-        STG_WR["pn-staging (172.16.4.0/22)<br/>API + replicate-analytics<br/>(role: docia_staging_analytics)"]
-        SBX_WR["pn-sandbox (172.16.8.0/22)<br/>API + replicate-analytics<br/>(role: docia_sandbox_analytics)"]
-        PRD_WR["pn-prod (172.16.12.0/22)<br/>API + replicate-analytics<br/>(role: docia_prod_analytics)"]
+        STG_WR["pn-staging (172.16.4.0/22)<br/>replicate-analytics CronJob ONLY<br/>(role: docia_staging_analytics)"]
+        SBX_WR["pn-sandbox (172.16.8.0/22)<br/>replicate-analytics CronJob ONLY<br/>(role: docia_sandbox_analytics)"]
+        PRD_WR["pn-prod (172.16.12.0/22)<br/>replicate-analytics CronJob ONLY<br/>(role: docia_prod_analytics)"]
     end
 
-    VPC_ACL["VPC Network ACL (stacks/base)<br/>default_policy=DROP<br/>Allow ONLY pn-* -> pn-analytics:5432 (+ return)"]
+    VPC_ACL["VPC Network ACL (stacks/base)<br/>default_policy=DROP<br/>Allow ONLY pn-* -> 172.16.0.10/32:5432 (+ return)"]
 
     subgraph ANALYTICS_STACK["stacks/analytics (env=shared) — pn-analytics (172.16.0.0/24)"]
         subgraph RDB_ANALYTICS["Scaleway RDB PostgreSQL 16 (docia-shared-pg-analytics — 100% PRIVATE)<br/>Schemas & Grants managed by pulumi-postgresql"]
@@ -563,6 +566,12 @@ flowchart LR
     VPC_ACL --> SCH_STG & SCH_SBX & SCH_PRD
     MB -->|"Private SQL on pn-analytics (5432)<br/>RW public / RO staging, sandbox, prod"| RDB_ANALYTICS
 ```
+
+> [!WARNING]
+> **CTO Decision Required — Metabase OSS Authentication (ProConnect / OIDC) & Public Dashboards**:
+> * **Metabase Open Source (OSS) does NOT support OpenID Connect (ProConnect) natively** (OIDC / SAML / JWT SSO requires a paid Metabase Pro/Enterprise license).
+> * **Proxy trade-off (`oauth2-proxy` + ProConnect)**: Placing an OIDC proxy in front of Metabase OSS to protect `/api/*` while keeping public dashboards (`/public/dashboard/*`, `/api/public/*`) unauthenticated is **not natively supported by Scaleway Serverless Containers** (requires a reverse proxy such as Traefik + `ForwardAuth`) and still forces **double authentication** (ProConnect login + Metabase local email/password, as Metabase OSS does not accept `X-Forwarded-Email` header SSO).
+> * **Pragmatic baseline retained for launch**: Keep Metabase OSS on Scaleway Serverless Container (image mirrored & pinned by SHA-256 digest in the Shared Registry) with **strong native email/password authentication** (`MB_PASSWORD_COMPLEXITY=strong`, `MB_PASSWORD_LENGTH=12+`, `MB_ANON_TRACKING_ENABLED=false`) for internal BI users and native Metabase **Public Sharing links** for public dashboards — **to be reviewed and validated with the CTO**.
 
 ---
 
@@ -615,9 +624,29 @@ sequenceDiagram
 > **KEDA `cooldownPeriod` vs. HPA `stabilizationWindowSeconds`**:
 > In KEDA, `spec.cooldownPeriod` applies **only** when scaling down from `1` to `0` (`minReplicaCount: 0`). Because Document IA keeps at least 1 warm worker (`minReplicaCount >= 1`), anti-flapping cooldowns between `N` and `minReplicaCount` **must** be configured via `spec.advanced.horizontalPodAutoscalerConfig.behavior.scaleDown`.
 
-#### Reference `ScaledObject` Configuration (`stacks/apps`)
+#### Reference `TriggerAuthentication` & `ScaledObject` Configuration (`stacks/apps`)
+
+> [!IMPORTANT]
+> **Scaleway Managed Redis TLS & Auth for KEDA**: Scaleway Managed Redis 7+ enforces authentication (`username`/`password`) and TLS signed by a per-cluster Scaleway CA (`cluster.certificate`, exported in `DataStackSecrets.redis_ca_cert`). The `ScaledObject` **must** set `enableTLS: "true"` and reference a `TriggerAuthentication` backed by `docia-keda-redis-secret` (`username`, `password`, `ca`); otherwise KEDA fails with TLS/NOAUTH errors and workers never scale.
 
 ```yaml
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: docia-keda-redis-auth
+  namespace: docia-<env>
+spec:
+  secretTargetRef:
+    - parameter: username
+      name: docia-keda-redis-secret
+      key: username
+    - parameter: password
+      name: docia-keda-redis-secret
+      key: password
+    - parameter: ca
+      name: docia-keda-redis-secret
+      key: ca
+---
 apiVersion: keda.sh/v1alpha1
 kind: ScaledObject
 metadata:
@@ -651,19 +680,26 @@ spec:
         stream: "event_stream"
         consumerGroup: "workflow_execution_consumer"
         lagCount: "10"              # Target lag per worker replica (= THREAD_PER_WORKER)
+        enableTLS: "true"           # Mandatory for Scaleway Managed Redis TLS
+      authenticationRef:
+        name: docia-keda-redis-auth
 ```
 
 #### Baseline Scaling Profiles by Environment
 
 | Parameter | `staging` / `sandbox` | `prod` |
 |---|---|---|
-| **`document-ia-api` Replicas** | 1 (fixed) | $\ge 2$ (fixed + `PodDisruptionBudget`; optional CPU HPA) |
-| **`document-ia-worker` `minReplicaCount` / `maxReplicaCount`** | `1` / `3` | `1`–`2` / `5`–`10` |
+| **`document-ia-api` Replicas** | 1 (`1Gi` RAM, fixed) | **1 (`1Gi` RAM) at launch** *(see multi-replica note below)* |
+| **`document-ia-worker` `minReplicaCount` / `maxReplicaCount`** | `1` / `3` (`2Gi` RAM/pod) | `2` / `5`–`10` (`2Gi` RAM/pod, 1 CPU-bound thread via semaphore + 7 HTTP I/O threads) |
 | **`lagCount` (Messages / Worker)** | `10` | `10` (aligned with `THREAD_PER_WORKER`) |
 | **Scale-Up Policy** | `+1 Pod / 120s` (`stabilizationWindow: 30s`) | `+1 Pod / 120s` (`stabilizationWindow: 30s`) |
 | **Scale-Down Policy** | `-1 Pod / 300s` (`stabilizationWindow: 300s`) | `-1 Pod / 300s` (`stabilizationWindow: 300s`) |
-| **`terminationGracePeriodSeconds`** | `180` | `180` |
-| **Kapsule `workers` Node Pool (`min_size..max_size`)** | `1..2` (`DEV1-M` 4 GiB) | `1..5` (`PRO2-S` 8 GiB, ~2–3 worker pods/node) |
+| **`terminationGracePeriodSeconds`** | `180` *(+ built-in `XAUTOCLAIM` zero-loss reclaim)* | `180` *(+ built-in `XAUTOCLAIM` zero-loss reclaim)* |
+| **Kapsule `workers` Node Pool (`min_size..max_size`)** | `1..2` (`DEV1-M` 4 GiB, 1 pod/node with `request <= 2Gi`) | `1..5` (`PRO2-S` 2 vCPU / 8 GiB, ~2 worker pods/node) |
+
+> [!WARNING]
+> **`document-ia-api` Multi-Replica Constraint (`AUTO_MIGRATE=true`)**:
+> Because `document-ia-api` currently runs Alembic `auto_migrate()` on container startup (`AUTO_MIGRATE=true`), starting multiple replicas simultaneously can cause DDL race conditions on `alembic_version`. At launch, `prod` runs **1 API replica (`1Gi` RAM)** (matching current ~26k files/day production load) with a generous `startupProbe`. Before scaling `document-ia-api` to $\ge 2$ replicas (+ `PodDisruptionBudget`), an application evolution in `document-ia` is required (PostgreSQL `pg_advisory_lock` around Alembic or a dedicated migration `initContainer`/Job).
 
 ---
 
@@ -698,7 +734,7 @@ All persistence layers rely on **Scaleway-native mechanisms** with strict region
 | Resource | Pulumi Class (`pulumiverse_scaleway`) | Key Configuration | Scope |
 |---|---|---|---|
 | **Shared Regional VPC** | `network.Vpc` | `enable_routing=True` (`docia-shared-vpc`, `fr-par`); hosts all isolated Private Networks with non-overlapping CIDRs | Project-wide |
-| **VPC Network ACL** | `network.Acl` | `default_policy="drop"` (`is_ipv6=False`); stateless rules allowing **only** `pn-<boundary> -> pn-analytics:5432` and matching return traffic (`5432 -> 1024-65535`); blocks all cross-env traffic | Project-wide |
+| **VPC Network ACL** | `network.Acl` | `default_policy="drop"` (`is_ipv6=False`); stateless rules pinned to the exact `/32` IP of `docia-shared-pg-analytics` (`pn-<boundary> -> 172.16.0.10/32:5432` and matching return `172.16.0.10/32:5432 -> pn-<boundary>:1024-65535`); blocks all cross-env traffic and prevents Metabase (in `pn-analytics`) from initiating source-port-5432 traffic to compute PNs | Project-wide |
 | **Scaleway Cockpit** | `observability.Cockpit` | Activates managed Loki / Prometheus / Grafana once for Scaleway project `DocumentIA` | Project singleton |
 | **Shared Container Registry** | `registry.Namespace` | `is_public=False`, regional `fr-par` OCI registry (`docia-shared`) hosting immutable images promoted across environments | Project-wide |
 | **CI Registry IAM App** | `iam.Application` + `Policy` + `ApiKey` | Dedicated least-privilege `ContainerRegistryFullAccess` identity for GitHub Actions image pushes (`document-ia`) | Project-wide |
@@ -709,19 +745,19 @@ All persistence layers rely on **Scaleway-native mechanisms** with strict region
 |---|---|---|---|---|
 | **Private Network** | `network.PrivateNetwork` | Attached to shared `vpc_id` from `stacks/base` with non-overlapping IPAM CIDR (`172.16.4.0/22`, `172.16.8.0/22`, `172.16.12.0/22`) | `/22` subnet | `/22` subnet |
 | **Public Gateway IP** | `vpcgw.Ip` | Static outbound IPv4 for NAT egress & optional SSH Bastion | 1 static IPv4 | 1 static IPv4 |
-| **Public Gateway** | `vpcgw.Gateway` + `GatewayNetwork` | `enable_masquerade=True`, `bastion_enabled=True` (for private admin/DB tunneling), attached to `PrivateNetwork` | `VPC-GW-S` | `VPC-GW-M` |
+| **Public Gateway** | `vpcgw.Gateway` + `GatewayNetwork` | `enable_masquerade=True`, attached to `PrivateNetwork`; **`bastion_enabled=True`** in non-prod/staging (with optional `bastion_allowed_ips`), **`bastion_enabled=False` by default in `prod`** (break-glass toggle + `bastion_allowed_ips` via Pulumi config) | `VPC-GW-S` (`bastion=on`) | `VPC-GW-M` (`bastion=off`, break-glass) |
 | **Reserved Ingress IP** | `loadbalancers.Ip` | Static public IPv4 reserved early, pointed to by OVH DNS `A` records, and bound to Traefik via Scaleway CCM in `stacks/cluster` | 1 static IPv4 | 1 static IPv4 |
-| **Cockpit Push Token** | `observability.Token` + `secrets.SecretVersion` | `scopes={"write_logs": True}`, token stored in Secret Manager (`/docia/<boundary>/cockpit-loki-token`) | 1 token per boundary | 1 token |
+| **Cockpit Push Token** | `observability.Token` | `scopes={"write_logs": True}`, exported via encrypted Pulumi `stack_secrets` (`cockpit_loki_token`) | 1 token per boundary | 1 token |
 
 #### Layer 1B — Stack `stacks/analytics` (`env=shared`, Private Analytics RDB, Schema RBAC & Metabase Serverless Container)
 
 | Resource | Pulumi Class (`pulumiverse_scaleway` / `pulumi_postgresql`) | Key Configuration | Sizing |
 |---|---|---|---|
 | **Analytics Private Network** | `scaleway.network.PrivateNetwork` | `docia-analytics-pn` (`172.16.0.0/24`) attached to shared `vpc_id` from `stacks/base` | `/24` subnet |
-| **Analytics PostgreSQL (100% Private)** | `scaleway.databases.Instance` + `Database` + `Acl` | PostgreSQL 16 (`docia-shared-pg-analytics`), attached **exclusively to `docia-analytics-pn`**, **empty public ACL (zero public IP)**, `backup_same_region=True`, **24h schedule / 30-day retention**, Pulumi `protect=True` | `DB-DEV-M` or `DB-PRO2-XS` |
+| **Analytics PostgreSQL (100% Private)** | `scaleway.databases.Instance` + `Database` + `Acl` | PostgreSQL 16 (`docia-shared-pg-analytics`), attached **exclusively to `docia-analytics-pn`** with deterministic static private IP (`analytics_db_private_ip`, e.g. `172.16.0.10/24` via `ip_net` / IPAM reservation matching the `/32` VPC ACL), **empty public ACL (zero public IP)**, `backup_same_region=True`, **24h schedule / 30-day retention**, Pulumi `protect=True` | `DB-DEV-M` or `DB-PRO2-XS` |
 | **Schemas & Roles** | `postgresql.Schema` + `postgresql.Role` + `postgresql.Grant` + `postgresql.DefaultPrivileges` | Applied over private Bastion SSH tunnel: schemas `staging`, `sandbox`, `prod`; `metabase` role (RW `public`, RO env schemas); `docia_<env>_analytics` roles (RW own `<env>` schema) | Least-privilege schema RBAC |
-| **Analytics Credentials** | `scaleway.secrets.Secret` + `SecretVersion` | `/docia/shared/metabase-db-credentials` and `/docia/<env>/analytics-db-credentials` | Scaleway Secret Manager |
-| **Metabase Serverless Container** | `scaleway.containers.Namespace` + `Container` + `Domain` | `min_scale=1`, `max_scale=1`, `port=3000`, `private_network_id=docia-analytics-pn.id` (connects directly to Analytics PG private IP), managed Let's Encrypt TLS (`metabase.<domain>`) once OVH `CNAME` points to `metabase_cname_target` | 2–4 GiB RAM, 1–2 vCPU |
+| **Analytics Credentials** | Pulumi `stack_secrets` (`pulumi.Output.secret`) | Encrypted cross-stack export of `metabase` and per-env `docia_<env>_analytics` passwords (consumed directly by `stacks/apps` without Secret Manager round-trips) | Encrypted in Pulumi S3 state |
+| **Metabase Serverless Container** | `scaleway.containers.Namespace` + `Container` + `Domain` | `min_scale=1`, `max_scale=1`, `port=3000`, `private_network_id=docia-analytics-pn.id` (connects directly to Analytics PG private IP), **image mirrored & pinned by SHA-256 digest** in Shared Scaleway Registry (`rg.fr-par.scw.cloud/docia-shared/metabase@sha256:...` — no mutable Docker Hub tag), hardened env (`MB_ANON_TRACKING_ENABLED=false`, strong password policy), managed Let's Encrypt TLS (`metabase.<domain>`) once OVH `CNAME` points to `metabase_cname_target` | 2–4 GiB RAM, 1–2 vCPU |
 
 #### Layer 1C — Stack `stacks/observability` (`env=shared`, Grafana Dashboards & Alerting as Code)
 
@@ -736,33 +772,33 @@ All persistence layers rely on **Scaleway-native mechanisms** with strict region
 
 | Resource | Pulumi Class (`pulumiverse_scaleway`) | Key Configuration | Sizing (`staging` / `sandbox`) | Sizing (`prod`) |
 |---|---|---|---|---|
-| **Documents S3 Bucket** | `object.Bucket` + `object.BucketPolicy` | `acl="private"`, **7-day object expiration lifecycle rule** aligned with `EVENT_STORE_PPI_RETENTION_DAYS=7` + 1-day `AbortIncompleteMultipartUpload`; **explicit S3 Bucket Policy** scoping `docia-<env>-s3-app` strictly to this bucket (and preventing access to the Pulumi state bucket in the same `DocumentIA` project) | Standard (`fr-par`) | Standard / Multi-AZ (`fr-par`) |
-| **Runtime S3 IAM App** | `iam.Application` + `Policy` + `ApiKey` | `default_project_id` = `DocumentIA`; paired with S3 Bucket Policies for per-bucket isolation | 1 IAM App per env | 1 IAM App |
+| **Documents S3 Bucket** | `object.Bucket` + `object.BucketPolicy` | `acl="private"`, **7-day object expiration lifecycle rule** aligned with `EVENT_STORE_PPI_RETENTION_DAYS=7` + 1-day `AbortIncompleteMultipartUpload`; **`scaleway.object.BucketPolicy`** granting `s3:ListBucket`/`GetObject`/`PutObject`/`DeleteObject`/`AbortMultipartUpload` exclusively to `Principal: {"SCW": ["application_id:<app_id>"]}` on `["<bucket>", "<bucket>/*"]` | Standard (`fr-par`) | Standard / Multi-AZ (`fr-par`) |
+| **Runtime S3 IAM App** | `iam.Application` + `iam.ApiKey` *(NO project-wide `iam.Policy`)* | `default_project_id` = `DocumentIA` with **zero project-wide `ObjectStorage*` IAM Policy** (access granted solely via its own `BucketPolicy`, enforcing implicit Deny on all other project buckets including `prod` and the Pulumi state bucket) | 1 IAM App per env | 1 IAM App |
 | **Main PostgreSQL RDB** | `databases.Instance` + `Database` + `User` + `Acl` | PostgreSQL 16 (`docia-<env>-pg-main`), attached **exclusively to `PrivateNetwork`** (empty public ACL), `backup_same_region=True`, **7-day GDPR-aligned retention** (`24h` non-prod / `6h`–`12h` prod), Pulumi `protect=True` in prod | `DB-DEV-S` (1 node) | `DB-PRO2-XS` or `S` (**HA 2 nodes**, Block SSD) |
 | **Managed Redis 7+** | `redis.Cluster` | **Redis $\ge 7.0$ mandatory** (consumer-group lag in admission Lua script), **`settings={"maxmemory-policy": "noeviction"}` mandatory**, attached **exclusively to `PrivateNetwork`**, TLS enabled | `RED1-MICRO` (1 node) | `RED1-S` or `RED1-M` (**HA Cluster / Replica**, $\ge 2\text{ GiB}$) |
-| **Application Secrets** | `secrets.Secret` + `SecretVersion` | `/docia/<env>/runtime-secrets` (`DOCUMENT_IA_API_KEY`, `API_KEY_PEPPER_HASH`, `API_KEY_PEPPER_CHK`, `WEBHOOK_SECRET_ENCRYPTION_KEY`, `OPENAI_API_KEY` Albert, DB/Redis/S3 URLs, ProConnect OIDC secrets) | Scaleway Secret Manager | Scaleway Secret Manager |
+| **Generated Infra Credentials** | Pulumi `stack_secrets` (`pulumi.Output.secret`) | Exports generated DB password, Redis password (+ TLS CA cert), and S3 IAM API keys in encrypted `stack_secrets` (separate from `stack_data`) for `stacks/apps` | Encrypted in Pulumi S3 state | Encrypted in Pulumi S3 state |
 
 #### Layer 3 — Stack `stacks/cluster` (Per Topology Boundary: `staging`/`sandbox`/`prod` in Option A, `non-prod`/`prod` in Option B)
 
 | Resource | Pulumi Class (`pulumiverse_scaleway` / `pulumi_kubernetes`) | Key Configuration | Sizing (`staging`/`sandbox` or `non-prod`) | Sizing (`prod`) |
 |---|---|---|---|---|
 | **Kapsule Cluster** | `scaleway.kubernetes.Cluster` | Managed control plane (`cni="cilium"`), attached to `PrivateNetwork` | Kapsule (free control plane) | Kapsule (free control plane) |
-| **Node Pool `api-system`** | `scaleway.kubernetes.Pool` | **`public_ip_disabled=True`**, `autohealing=True`; runs API, Console/Evals, CronJobs, Traefik, `cert-manager`, KEDA | 1–2x `DEV1-M` (3 vCPU, 4 GiB) | 2–3x `PRO2-S` (2 vCPU, 8 GiB) |
-| **Node Pool `workers`** | `scaleway.kubernetes.Pool` | **`public_ip_disabled=True`**, `autoscaling=True`, `autohealing=True`; dedicated to `document-ia-worker` pods (`2Gi`–`3Gi` RAM/pod, see [Section 4.6](#46-event-driven-worker-auto-scaling-keda--hpa--kapsule-cluster-autoscaler)) | 1..2x `DEV1-M` (4 GiB) | 1..5x `PRO2-S` (8 GiB, ~2–3 worker pods/node) |
-| **Traefik Gateway + LB** | `helm.v3.Release` (`traefik`) | Provisioned with Scaleway CCM annotations binding the single Scaleway Load Balancer (`LB-S` / `LB-GP-M`) to `lb_reserved_ip_id` in **TCP L4 + Proxy Protocol v2** mode (no duplicate `loadbalancers.Lb` resource) | 1 LB per cluster | 1 LB |
+| **Node Pool `api-system`** | `scaleway.kubernetes.Pool` | **`public_ip_disabled=True`**, `autohealing=True`; runs API (`1Gi`), Console/Evals, CronJobs, Traefik, `cert-manager`, KEDA | 1–2x `DEV1-M` (3 vCPU, 4 GiB) | 2x `PRO2-S` (2 vCPU, 8 GiB) |
+| **Node Pool `workers`** | `scaleway.kubernetes.Pool` | **`public_ip_disabled=True`**, `autoscaling=True`, `autohealing=True`; dedicated to `document-ia-worker` pods (`2Gi` RAM/pod, 1 CPU-bound inference thread via semaphore + 7 HTTP I/O threads, see [Section 4.6](#46-event-driven-worker-auto-scaling-keda--hpa--kapsule-cluster-autoscaler)) | 1..2x `DEV1-M` (4 GiB, 1 pod/node with `request <= 2Gi`) | 1..5x `PRO2-S` (2 vCPU, 8 GiB, ~2 worker pods/node) |
+| **Traefik Gateway + LB** | `helm.v3.Release` (`traefik`) | Provisioned with Scaleway CCM annotations binding the single Scaleway Load Balancer (`LB-S` / `LB-GP-M`) to `lb_reserved_ip_id` in **TCP L4 + Proxy Protocol v2** mode (`scw-loadbalancer-proxy-protocol-v2: "true"`, **`scw-loadbalancer-use-hostname: "true"`** to prevent `cert-manager` HTTP-01 hairpinning failures, and `proxyProtocol.trustedIPs` set to `private_subnet_cidr`) | 1 LB per cluster | 1 LB |
 | **Automated TLS (`cert-manager`)** | `helm.v3.Release` (`cert-manager`) + `ClusterIssuer` | ACME Let's Encrypt **HTTP-01** `ClusterIssuer` (`letsencrypt-prod`); issues & renews TLS 1.3 certs automatically for every `Ingress` (DNS-provider agnostic, works with OVH) | 1 per cluster | 1 |
 | **KEDA Operator** | `helm.v3.Release` (`keda`) | Installs KEDA controller & `ScaledObject` CRDs before `stacks/apps` runs | 1 per cluster | 1 |
 | **Kubernetes Namespaces** | `core.v1.Namespace` | Option A: `docia-<env>` / Option B: `docia-staging` + `docia-sandbox` (on `non-prod`), `docia-prod` (on `prod`) | 1 or 2 namespaces | 1 namespace |
-| **Kubeconfig Secret** | `scaleway.secrets.SecretVersion` | Stores cluster kubeconfig in Secret Manager (`/docia/<boundary>/kubeconfig`) so `stacks/apps` consumes only a `secret_id` (zero plaintext kubeconfig in `stack_data`) | Scaleway Secret Manager | Scaleway Secret Manager |
+| **Kubeconfig Export** | Pulumi `stack_secrets` (`pulumi.Output.secret`) | Exports cluster kubeconfig via encrypted `stack_secrets` (separate from `stack_data`, zero plaintext kubeconfig in `stack_data`) | Encrypted in Pulumi S3 state | Encrypted in Pulumi S3 state |
 
 #### Layer 4 — Stack `stacks/apps` (Always Per Environment: `staging`, `sandbox`, `prod`)
 
 | Resource | Pulumi Class (`pulumi_kubernetes`) | Key Configuration | Sizing (`staging` / `sandbox`) | Sizing (`prod`) |
 |---|---|---|---|---|
-| **Runtime Secrets** | `core.v1.Secret` (`docia-runtime-env`) | Materialized directly by Pulumi from `stacks/data` (`runtime_secrets_id`), `stacks/analytics` (`analytics_credentials_secret_id`), and `stacks/network` (`cockpit_token_secret_id`) | 1 Secret per env namespace | 1 Secret |
-| **Cilium Isolation** | `networking.v1.NetworkPolicy` | Strict East-West & anti-SSRF rules isolating pods to their own env's Main RDB, Redis, `pn-analytics:5432` (for API & `replicate-analytics` only), and authorized egress | Applied per env namespace | Applied per env namespace |
-| **API & Console (Evals)** | `apps.v1.Deployment` + `core.v1.Service` | • `document-ia-api` (`AUTO_MIGRATE=true`, `/api/v1/health` probes)<br/>• `document-ia-evals` (Streamlit Console + ProConnect OIDC) | 1 API replica, 1 Console replica | $\ge 2$ API replicas (PDB), 1–2 Console replicas |
-| **Workers & KEDA** | `apps.v1.Deployment` + `keda.sh/v1alpha1.ScaledObject` | `document-ia-worker` (prewarms 4 SHA-256 AI models, consumes `event_stream`, `terminationGracePeriodSeconds: 180`) + KEDA `ScaledObject` (`lagCount: "10"`, `+1/120s` up, `300s` stabilization & `-1/300s` down) | 1..3 replicas | 1–2..5–10 replicas |
+| **Role-Scoped Runtime Secrets** | `core.v1.Secret` (6 dedicated secrets) | Least-privilege secrets materialized per workload (`docia-api-secret`, `docia-worker-secret`, `docia-evals-secret`, `docia-cron-ppi-secret`, `docia-cron-analytics-secret`, `docia-keda-redis-secret`) from upstream Pulumi `stack_secrets` + external secrets stored via `pulumi config set --secret` (`stacks/apps/Pulumi.<env>.yaml`: `OPENAI_API_KEY`, `PROCONNECT_CLIENT_SECRET`, `API_KEY_PEPPER_*`, `WEBHOOK_SECRET_ENCRYPTION_KEY`, `DOCUMENT_IA_API_KEY`). Zero plaintext passwords in Pod `env:` specs | 6 scoped Secrets per env | 6 scoped Secrets |
+| **Cilium Isolation** | `networking.v1.NetworkPolicy` | Strict East-West & anti-SSRF rules isolating pods to their own env's Main RDB, Redis, `pg-analytics` (`172.16.0.10/32:5432`, for **`replicate-analytics` CronJob only**), and authorized egress | Applied per env namespace | Applied per env namespace |
+| **API & Console (Evals)** | `apps.v1.Deployment` + `core.v1.Service` | • `document-ia-api` (`1Gi` RAM, `AUTO_MIGRATE=true`, `startupProbe` + `/api/v1/health` probes)<br/>• `document-ia-evals` (Streamlit Console + ProConnect OIDC) | 1 API replica, 1 Console replica | 1 API replica at launch *(multi-replica requires `document-ia` migration lock)*, 1–2 Console replicas |
+| **Workers & KEDA** | `apps.v1.Deployment` + `keda.sh/v1alpha1.TriggerAuthentication` + `ScaledObject` | `document-ia-worker` (prewarms 4 SHA-256 AI models, consumes `event_stream`, `terminationGracePeriodSeconds: 180`) + KEDA `TriggerAuthentication` (Redis TLS `ca` + auth) & `ScaledObject` (`lagCount: "10"`, `enableTLS: "true"`, `+1/120s` up, `300s` stabilization & `-1/300s` down) | 1..3 replicas | 1–2..5–10 replicas |
 | **Scheduled Jobs** | `batch.v1.CronJob` | • `remove-ppi` (`0 3 * * *`, size `S` equivalent)<br/>• `replicate-analytics` (`0 5 * * *`, `ANALYTICS_POSTGRES_SCHEMA=<env>`, size `L` equivalent) | 2 CronJobs | 2 CronJobs |
 | **Ingress (Automated TLS)** | `networking.v1.Ingress` | Host-based TLS 1.3 routing (`api.<env>.*`, `console.<env>.*`; prod: `api.*`, `console.*`) targeting **Traefik** with `cert-manager.io/cluster-issuer: letsencrypt-prod` (DNS `A` records hosted on OVH) | Per-env hostnames | Prod hostnames |
 
@@ -793,32 +829,33 @@ flowchart TB
     end
 
     subgraph LAYER_2["Layer 2: Environment Data Stores (Always per env: staging, sandbox, prod)"]
-        S_DATA["stacks/data (env=&lt;env&gt;)<br/>S3 (+ Bucket Policy), Main PG 16, Redis 7+, Runtime Secrets<br/>Exports: DataStackOutput"]
+        S_DATA["stacks/data (env=&lt;env&gt;)<br/>S3 (+ Bucket Policy), Main PG 16, Redis 7+<br/>Exports: DataStackOutput + stack_secrets"]
     end
 
     subgraph LAYER_3["Layer 3: Kubernetes Cluster & Platform (Opt A: staging/sandbox/prod · Opt B: non-prod/prod)"]
-        S_CLUSTER["stacks/cluster (env=&lt;boundary&gt;)<br/>Kapsule (Cilium), Private Pools, Traefik (LB), cert-manager, KEDA, Namespaces<br/>Exports: ClusterStackOutput"]
+        S_CLUSTER["stacks/cluster (env=&lt;boundary&gt;)<br/>Kapsule (Cilium), Private Pools, Traefik (LB), cert-manager, KEDA, Namespaces<br/>Exports: ClusterStackOutput + stack_secrets"]
     end
 
     subgraph LAYER_4["Layer 4: Application Workloads (Always per env: staging, sandbox, prod)"]
-        S_APPS["stacks/apps (env=&lt;env&gt;)<br/>v1.Secret, NetPol, API, Worker + KEDA SO, Console/Evals, 2 CronJobs, Ingress (TLS)<br/>Exports: AppsStackOutput"]
+        S_APPS["stacks/apps (env=&lt;env&gt;)<br/>5 Role-Scoped v1.Secrets, NetPol, API, Worker + KEDA SO, Console/Evals, 2 CronJobs, Ingress (TLS)<br/>Exports: AppsStackOutput"]
     end
 
     S_BASE -->|"vpc_id, subnet_cidrs, cockpit_loki_url"| S_NET
-    S_BASE -->|"vpc_id, analytics_subnet_cidr"| S_ANALYTICS
+    S_BASE -->|"vpc_id, analytics_subnet_cidr, analytics_db_private_ip"| S_ANALYTICS
     S_BASE -->|"cockpit_grafana_url, cockpit_loki_url"| S_OBS
     S_BASE -->|"registry_endpoint"| S_APPS
     S_NET -->|"private_network_id"| S_DATA
     S_NET -->|"private_network_id, lb_reserved_ip_id, lb_public_ip"| S_CLUSTER
-    S_NET -->|"cockpit_token_secret_id"| S_APPS
+    S_NET -->|"stack_secrets (cockpit_loki_token)"| S_APPS
     S_ANALYTICS -->|"analytics_db_private_host, env_schemas[env]"| S_DATA
-    S_DATA -->|"main_db, redis, s3, analytics_private_host, runtime_secrets_id"| S_APPS
-    S_CLUSTER -->|"kubeconfig_secret_id, namespace, ingress_class, cert_issuer"| S_APPS
+    S_ANALYTICS -->|"stack_secrets (analytics_db_creds[env])"| S_APPS
+    S_DATA -->|"main_db, redis, s3 + stack_secrets (creds)"| S_APPS
+    S_CLUSTER -->|"namespace, ingress_class, cert_issuer + stack_secrets (kubeconfig)"| S_APPS
 ```
 
 #### Deterministic Rollout & Teardown Sequence
 
-Because `stacks/analytics` and `stacks/observability` depend only on `stacks/base`, **Layer 1A (`stacks/network`), Layer 1B (`stacks/analytics`), and Layer 1C (`stacks/observability`) have no dependency on each other** (note: deploying at least one `stacks/network` first provides the SSH Bastion used to run `pulumi-postgresql` against the private Analytics RDB). Once `stacks/network` and `stacks/analytics` are up, configure the static `A` / `CNAME` records in **OVH** using their exported `lb_public_ip` and `metabase_cname_target` outputs so Let's Encrypt validation succeeds automatically.
+Because `stacks/analytics` and `stacks/observability` depend only on `stacks/base` in the Pulumi resource graph, **Layer 1A (`stacks/network`), Layer 1B (`stacks/analytics`), and Layer 1C (`stacks/observability`) have no circular dependency**—operationally, deploy at least one non-prod/staging `stacks/network` before `stacks/analytics` so the `Makefile` SSH ControlSocket tunnel wrapper (`scripts/with_analytics_tunnel.sh`, targeting deterministic IP `172.16.0.10:5432` with `trap EXIT` cleanup) has an active Bastion for `pulumi-postgresql`. Once `stacks/network` and `stacks/analytics` are up, configure the static `A` / `CNAME` records in **OVH** using their exported `lb_public_ip` and `metabase_cname_target` outputs so Let's Encrypt validation succeeds automatically.
 
 1. **Provisioning (`make up`) — Topology A (Fully Symmetric: 3 Clusters)**:
    ```bash
@@ -887,13 +924,15 @@ Because `stacks/analytics` and `stacks/observability` depend only on `stacks/bas
    ```
 3. **Teardown (`make destroy`)**: Always execute in the exact **reverse topological order** (`apps` $\rightarrow$ `cluster` $\rightarrow$ `data` $\rightarrow$ `observability` & `analytics` & `network` $\rightarrow$ `base`) so Kubernetes and managed services release all `PrivateNetwork` DHCP leases before the `PrivateNetwork`s and shared `VPC` are deleted.
 
-### 5.2. Security Rule for Cross-Stack Contracts (`STACK_DATA_KEY`)
+### 5.2. Security Rule for Cross-Stack Contracts (`stack_data` vs. `stack_secrets`)
 
 > [!IMPORTANT]
-> **Zero Plaintext Secrets in Cross-Stack Outputs (`stack_data`)**:
-> Every stack exports a single typed dictionary under `STACK_DATA_KEY = "stack_data"` consumed via `infra_lib.get_stack_data(project_name, env)` (`organization/<project_name>/<env>`).
-> * **Never export raw passwords, kubeconfigs, API tokens, or private keys in `stack_data`**.
-> * Upstream stacks (`base`, `network`, `analytics`, `data`, `cluster`) write sensitive credentials directly into **Scaleway Secret Manager** (`scaleway.secrets.Secret` + `SecretVersion`) and export only the **Secret UUID (`secret_id`)** and non-sensitive network coordinates (`ip`, `host`, `port`, `bucket_name`, `namespace`) in `outputs.py`.
+> **Strict Separation of Non-Sensitive Outputs (`stack_data`) & Encrypted Secrets (`stack_secrets`)**:
+> * Every stack exports non-sensitive network coordinates (`ip`, `host`, `port`, `bucket_name`, `namespace`) under `STACK_DATA_KEY = "stack_data"` consumed via `infra_lib.get_stack_data(project_name, env)`.
+> * **Never place a `pulumi.Output.secret(...)` inside `stack_data`** (Pulumi taints the entire exported dictionary as `[secret]`, hiding all non-sensitive IPs/URLs from `pulumi preview` and `pulumi stack output`).
+> * Infra-generated credentials (DB/Redis passwords, S3 IAM keys, Cockpit Loki token, kubeconfig) are exported in a **separate encrypted output** `STACK_SECRETS_KEY = "stack_secrets"` (`pulumi.Output.secret({...})`), encrypted with `PULUMI_CONFIG_PASSPHRASE` in the S3 state backend and read only by `stacks/apps` via `infra_lib.get_stack_secrets(project_name, env)`.
+> * **External / manually-supplied application secrets** (`OPENAI_API_KEY` Albert, `PROCONNECT_CLIENT_SECRET`, `API_KEY_PEPPER_HASH`, `API_KEY_PEPPER_CHK`, `WEBHOOK_SECRET_ENCRYPTION_KEY`, `DOCUMENT_IA_API_KEY`) are stored per environment via **`pulumi config set --secret`** in `stacks/apps/Pulumi.<env>.yaml`.
+> * **Zero monolithic Kubernetes Secret & zero plaintext `env:` passwords**: `stacks/apps` materializes **dedicated `core.v1.Secret` objects per workload role** (`docia-api-secret`, `docia-worker-secret`, `docia-evals-secret`, `docia-cron-ppi-secret`, `docia-cron-analytics-secret`) so each pod receives strictly the credentials it needs via `envFrom: secretRef`.
 
 ---
 
@@ -906,7 +945,7 @@ Because `stacks/analytics` and `stacks/observability` depend only on `stacks/bas
 
 ```mermaid
 flowchart LR
-    VPC["scaleway.network.Vpc<br/>(docia-shared-vpc, enable_routing=True)"] --> VPC_ACL["scaleway.network.Acl<br/>(default_policy='drop'<br/>Allow ONLY pn-* -> pn-analytics:5432 + return)"]
+    VPC["scaleway.network.Vpc<br/>(docia-shared-vpc, enable_routing=True)"] --> VPC_ACL["scaleway.network.Acl<br/>(default_policy='drop'<br/>Allow ONLY pn-* -> 172.16.0.10/32:5432 + return)"]
     COCKPIT["scaleway.observability.Cockpit<br/>(DocumentIA Project Singleton)"]
     REG["scaleway.registry.Namespace<br/>(docia-shared, is_public=False)"]
     CI_APP["scaleway.iam.Application<br/>(docia-ci-registry)"] --> CI_POL["scaleway.iam.Policy<br/>(ContainerRegistryFullAccess)"]
@@ -923,6 +962,7 @@ class BaseStackOutput(TypedDict):
     region: str
     vpc_id: str                       # Shared Regional VPC (docia-shared-vpc)
     analytics_subnet_cidr: str        # e.g. "172.16.0.0/24"
+    analytics_db_private_ip: str      # Deterministic /32 host IP inside pn-analytics (e.g. "172.16.0.10") pinned in VPC ACL
     boundary_subnet_cidrs: dict[str, str]  # e.g. {"staging": "172.16.4.0/22", ...} or {"non-prod": "172.16.4.0/22", "prod": "172.16.12.0/22"}
     cockpit_grafana_url: str          # Cockpit Grafana URL (consumed by stacks/observability)
     cockpit_loki_url: str             # https://logs.cockpit.fr-par.scw.cloud/loki/api/v1/push
@@ -944,17 +984,17 @@ class BaseStackOutput(TypedDict):
 flowchart LR
     REF_BASE[["StackReference: stacks/base (shared)<br/>-> vpc_id, subnet_cidr, cockpit_loki_url"]]
     REF_BASE --> PN["scaleway.network.PrivateNetwork<br/>(docia-boundary-pn, CIDR in shared VPC)"]
-    PGW_IP["scaleway.vpcgw.Ip<br/>(docia-boundary-pgw-ip)"] --> PGW["scaleway.vpcgw.Gateway<br/>(docia-boundary-pgw, bastion_enabled=True)"]
+    PGW_IP["scaleway.vpcgw.Ip<br/>(docia-boundary-pgw-ip)"] --> PGW["scaleway.vpcgw.Gateway<br/>(docia-boundary-pgw, bastion: non-prod=on / prod=break-glass + allowed_ips)"]
     PN & PGW --> GW_NET["scaleway.vpcgw.GatewayNetwork<br/>(enable_masquerade=True)"]
 
     LB_IP["scaleway.loadbalancers.Ip<br/>(docia-boundary-lb-ip)"]
     REF_BASE --> C_TOK["scaleway.observability.Token<br/>(write_logs=True)"]
-    C_TOK --> C_SEC["scaleway.secrets.SecretVersion<br/>(/docia/boundary/cockpit-loki-token)"]
 
-    GW_NET & LB_IP & C_SEC --> OUT[["Export: NetworkStackOutput<br/>(stack_data)"]]
+    GW_NET & LB_IP --> OUT[["Export: NetworkStackOutput<br/>(stack_data)"]]
+    C_TOK --> OUT_SEC[["Export: NetworkStackSecrets<br/>(stack_secrets — encrypted)"]]
 ```
 
-#### Typed Output Contract (`stacks/network/outputs.py`)
+#### Typed Output Contracts (`stacks/network/outputs.py`)
 
 ```python
 class NetworkStackOutput(TypedDict):
@@ -970,7 +1010,10 @@ class NetworkStackOutput(TypedDict):
     lb_reserved_ip_id: str            # Bound to Traefik Load Balancer in stacks/cluster
     lb_public_ip: str                 # Static public ingress IPv4 (target for OVH DNS 'A' records)
     cockpit_loki_url: str
-    cockpit_token_secret_id: str      # Scaleway Secret Manager UUID holding LOKI_BEARER_TOKEN
+
+
+class NetworkStackSecrets(TypedDict): # Exported via pulumi.Output.secret(...) under stack_secrets
+    cockpit_loki_token: str           # LOKI_BEARER_TOKEN consumed by stacks/apps
 ```
 
 ---
@@ -979,19 +1022,19 @@ class NetworkStackOutput(TypedDict):
 
 * **Scope**: Global shared stack (`env="shared"`).
 * **Upstream Stack Dependencies**:
-  * `stacks/base` (`env="shared"`) $\rightarrow$ `vpc_id` and `analytics_subnet_cidr` (`172.16.0.0/24`).
+  * `stacks/base` (`env="shared"`) $\rightarrow$ `vpc_id`, `analytics_subnet_cidr` (`172.16.0.0/24`), and `analytics_db_private_ip` (`172.16.0.10`).
 * **100 % Private DB & Decoupled Metabase**:
-  * `docia-shared-pg-analytics` attaches exclusively to `docia-analytics-pn` with an empty public ACL (zero public IP).
-  * Uses `pulumi-postgresql` (tunneled through a Public Gateway SSH Bastion) to create schemas (`staging`, `sandbox`, `prod`) and least-privilege schema grants.
+  * `docia-shared-pg-analytics` attaches exclusively to `docia-analytics-pn` with the deterministic static IP `analytics_db_private_ip` (`172.16.0.10/24`, matching the `/32` VPC ACL rule) and an empty public ACL (zero public IP).
+  * Uses `pulumi-postgresql` (connecting to `127.0.0.1:15432` over a `Makefile` SSH ControlSocket tunnel with `trap EXIT` to `172.16.0.10:5432` via the non-prod/staging Public Gateway Bastion, or directly to `172.16.0.10:5432` from a VPC CI runner) to create schemas (`staging`, `sandbox`, `prod`) and least-privilege schema grants.
   * Deploys **Metabase** as a **Scaleway Serverless Container** (`min_scale=1`, `max_scale=1`, `private_network_id=docia-analytics-pn.id`) with a managed TLS custom domain (`metabase.document-ia.beta.gouv.fr`).
 
 #### Intra-Stack Resource Dependency Graph (`stacks/analytics`)
 
 ```mermaid
 flowchart LR
-    REF_BASE[["StackReference: stacks/base (shared)<br/>-> vpc_id, analytics_subnet_cidr"]] --> PN_ANA["scaleway.network.PrivateNetwork<br/>(docia-analytics-pn, 172.16.0.0/24)"]
+    REF_BASE[["StackReference: stacks/base (shared)<br/>-> vpc_id, analytics_subnet_cidr, analytics_db_private_ip"]] --> PN_ANA["scaleway.network.PrivateNetwork<br/>(docia-analytics-pn, 172.16.0.0/24)"]
 
-    PN_ANA --> RDB["scaleway.databases.Instance<br/>(docia-shared-pg-analytics, PG 16, Private Only)"]
+    PN_ANA --> RDB["scaleway.databases.Instance<br/>(docia-shared-pg-analytics, PG 16, 172.16.0.10/32 Private Only)"]
     RDB --> ACL["scaleway.databases.Acl<br/>(Empty public ACL — Zero public IP)"]
     RDB --> DB["scaleway.databases.Database<br/>(docia_analytics)"]
 
@@ -1001,37 +1044,38 @@ flowchart LR
     PG_PROV --> R_ENV["postgresql.Role + Grant (per env)<br/>(docia_<env>_analytics: RW own schema)"]
     SCH --> R_MB & R_ENV
 
-    R_MB --> SEC_MB["scaleway.secrets.SecretVersion<br/>(/docia/shared/metabase-db-credentials)"]
-    R_ENV --> SEC_ENV["scaleway.secrets.SecretVersion<br/>(/docia/<env>/analytics-db-credentials)"]
-
     PN_ANA & R_MB --> MB_NS["scaleway.containers.Namespace<br/>(docia-analytics-metabase)"]
-    MB_NS --> MB_CTR["scaleway.containers.Container<br/>(metabase, min_scale=1, pn-analytics)"]
+    MB_NS --> MB_CTR["scaleway.containers.Container<br/>(metabase@sha256 from Shared Registry, min_scale=1, pn-analytics)"]
     MB_CTR --> MB_DOM["scaleway.containers.Domain<br/>(metabase.<domain>, Managed Let's Encrypt TLS via OVH CNAME)"]
 
-    ACL & SEC_MB & SEC_ENV & MB_DOM --> OUT[["Export: AnalyticsStackOutput<br/>(stack_data)"]]
+    ACL & MB_DOM --> OUT[["Export: AnalyticsStackOutput<br/>(stack_data)"]]
+    R_MB & R_ENV --> OUT_SEC[["Export: AnalyticsStackSecrets<br/>(stack_secrets — encrypted)"]]
 ```
 
-#### Typed Output Contract (`stacks/analytics/outputs.py`)
+#### Typed Output Contracts (`stacks/analytics/outputs.py`)
 
 ```python
 class AnalyticsEnvSchemaContract(TypedDict):
     schema_name: str                  # e.g. "staging", "sandbox", "prod"
     db_user: str                      # e.g. "docia_staging_analytics"
-    credentials_secret_id: str        # Scaleway Secret Manager UUID for this schema's writer user
 
 
 class AnalyticsStackOutput(TypedDict):
     analytics_private_network_id: str
     analytics_subnet_cidr: str        # "172.16.0.0/24"
     analytics_instance_id: str
-    analytics_db_private_host: str    # Private Network IP (172.16.0.x — zero public IP)
+    analytics_db_private_host: str    # Deterministic Private Network IP (e.g. "172.16.0.10" — pinned /32 in VPC ACL, zero public IP)
     analytics_db_port: int            # 5432
     analytics_db_name: str            # "docia_analytics"
     metabase_cname_target: str        # Scaleway Serverless Container default domain (target for OVH CNAME)
     metabase_url: str                 # https://metabase.<domain>
     metabase_db_user: str             # "metabase"
-    metabase_credentials_secret_id: str
     env_schemas: dict[str, AnalyticsEnvSchemaContract]
+
+
+class AnalyticsStackSecrets(TypedDict): # Exported via pulumi.Output.secret(...) under stack_secrets
+    metabase_db_password: str
+    env_db_passwords: dict[str, str]    # {"staging": "...", "sandbox": "...", "prod": "..."}
 ```
 
 ---
@@ -1078,6 +1122,14 @@ class ObservabilityStackOutput(TypedDict):
   1. `stacks/network` (`get_network_stack_output(network_env)`) $\rightarrow$ `private_network_id` (where `network_env` defaults to `ctx.env` in Topology A, or `"non-prod"` for `staging`/`sandbox` in Topology B).
   2. `stacks/analytics` (`get_analytics_stack_output("shared")`) $\rightarrow$ `analytics_db_private_host`, `analytics_db_port`, `analytics_db_name`, and `env_schemas[ctx.env]`.
 
+> [!IMPORTANT]
+> **Mandatory Scaleway S3 Per-Bucket Isolation Pattern (Single Project `DocumentIA`)**:
+> Because all environments and the Pulumi S3 state bucket coexist in a single Scaleway project (`DocumentIA`), attaching a project-wide `ObjectStorageFullAccess` / `ObjectStorageObjects*` `scaleway.iam.Policy` to `docia-<env>-s3-app` would grant that environment access to **every bucket in the project** (including `docia-prod-documents` and the Pulumi state bucket) unless blocked by an explicit `Deny` on every other bucket.
+> When implementing `stacks/data`, **strictly enforce both rules**:
+> 1. **Zero project-wide S3 `iam.Policy` on `docia-<env>-s3-app`**: Create only `scaleway.iam.Application` + `scaleway.iam.ApiKey` (`default_project_id=DocumentIA`). With no project-level S3 policy, Scaleway enforces an **implicit `Deny`** on all other buckets in the project (including other envs and the Pulumi state bucket).
+> 2. **Bucket-scoped `scaleway.object.BucketPolicy`** on `docia-<env>-documents`: Use Scaleway's native bucket policy format (`Version: "2023-04-17"`, bare bucket resource names `["<bucket_name>", "<bucket_name>/*"]`, and `Principal: {"SCW": ["application_id:<app_uuid>"]}`) to grant **only** `s3:ListBucket`, `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject`, and `s3:AbortMultipartUpload` to that environment's IAM application (while never adding a blanket `Deny` that would lock out human developers' `user_id`s or the CI admin key).
+> 3. **Defense-in-depth**: Never attach any `ObjectStorage*` IAM policy to `docia-<env>-s3-app`, and optionally add an explicit `Effect: "Deny"` statement on the Pulumi state bucket targeting unauthorized `application_id`s.
+
 #### Intra-Stack Resource Dependency Graph (`stacks/data`)
 
 ```mermaid
@@ -1085,10 +1137,10 @@ flowchart LR
     REF_NET[["StackReference: stacks/network (network_env)<br/>-> private_network_id"]]
     REF_ANA[["StackReference: stacks/analytics (shared)<br/>-> analytics_db_private_host, env_schemas[env]"]]
 
-    subgraph S3_BLOCK["1. Private S3, Scoped IAM & Bucket Policy"]
+    subgraph S3_BLOCK["1. Private S3, Policy-Less IAM App & Bucket Policy"]
         BKT["scaleway.object.Bucket<br/>(docia-env-documents, Lifecycle 7d)"]
-        IAM_APP["scaleway.iam.Application<br/>(docia-env-s3-app)"]
-        BKT & IAM_APP --> BKT_POL["scaleway.object.BucketPolicy<br/>(Strict per-bucket isolation vs Pulumi state)"]
+        IAM_APP["scaleway.iam.Application<br/>(docia-env-s3-app — NO project-wide S3 Policy)"]
+        BKT & IAM_APP --> BKT_POL["scaleway.object.BucketPolicy<br/>(Allow ONLY application_id on this bucket; implicit Deny elsewhere)"]
         IAM_APP --> IAM_KEY["scaleway.iam.ApiKey<br/>(default_project_id=DocumentIA)"]
     end
 
@@ -1104,11 +1156,11 @@ flowchart LR
     end
 
     REF_NET --> PG & REDIS
-    IAM_KEY & BKT_POL & PG_USR & REDIS & REF_ANA --> SEC["scaleway.secrets.SecretVersion<br/>(/docia/env/runtime-secrets)"]
-    SEC --> OUT[["Export: DataStackOutput<br/>(stack_data)"]]
+    BKT_POL & PG_ACL & REDIS & REF_ANA --> OUT[["Export: DataStackOutput<br/>(stack_data)"]]
+    IAM_KEY & PG_USR & REDIS --> OUT_SEC[["Export: DataStackSecrets<br/>(stack_secrets — encrypted)"]]
 ```
 
-#### Typed Output Contract (`stacks/data/outputs.py`)
+#### Typed Output Contracts (`stacks/data/outputs.py`)
 
 ```python
 class DataStackOutput(TypedDict):
@@ -1122,16 +1174,25 @@ class DataStackOutput(TypedDict):
     pg_main_private_host: str         # Private Network IP (172.16.x.x)
     pg_main_port: int                 # 5432
     pg_main_db_name: str              # document_ia
+    pg_main_db_user: str              # docia_<env>_app
     redis_cluster_id: str
     redis_private_host: str           # Private Network IP (172.16.x.x)
     redis_port: int                   # 6379
     redis_tls_enabled: bool           # True
-    runtime_secrets_id: str           # Scaleway Secret Manager UUID (/docia/<env>/runtime-secrets)
-    analytics_db_private_host: str    # Forwarded private IP (172.16.0.x) from stacks/analytics
+    analytics_db_private_host: str    # Forwarded deterministic private IP (e.g. "172.16.0.10") from stacks/analytics
     analytics_db_port: int
     analytics_db_name: str
     analytics_db_schema: str          # ANALYTICS_POSTGRES_SCHEMA=<env>
-    analytics_credentials_secret_id: str
+    analytics_db_user: str            # docia_<env>_analytics
+
+
+class DataStackSecrets(TypedDict):    # Exported via pulumi.Output.secret(...) under stack_secrets
+    s3_access_key: str
+    s3_secret_key: str
+    pg_main_password: str
+    redis_username: str
+    redis_password: str
+    redis_ca_cert: str                # Scaleway Managed Redis TLS CA certificate (for apps + KEDA TriggerAuthentication)
 ```
 
 ---
@@ -1157,22 +1218,21 @@ flowchart TB
 
     subgraph STEP_2["Step 2: Cluster-Wide Operators, Traefik + cert-manager & Namespaces"]
         K_PROV["pulumi_kubernetes.Provider<br/>(from K8S kubeconfig)"]
-        KUBE_SEC["scaleway.secrets.SecretVersion<br/>(/docia/boundary/kubeconfig)"]
         NS["core.v1.Namespace<br/>(Opt A: docia-env · Opt B: docia-staging, docia-sandbox)"]
         KEDA_HELM["helm.v3.Release ('keda')<br/>(Installs KEDA Operator & ScaledObject CRDs)"]
         CERT_HELM["helm.v3.Release ('cert-manager') + ClusterIssuer<br/>(Automated Let's Encrypt HTTP-01 TLS)"]
         ING_HELM["helm.v3.Release ('traefik')<br/>(Scaleway CCM -> lb_reserved_ip_id, TCP L4 + Proxy Protocol v2)"]
 
         POOL_SYS & POOL_WRK --> K_PROV
-        K8S --> KUBE_SEC
         K_PROV --> NS & KEDA_HELM & CERT_HELM & ING_HELM
     end
 
     REF_NET --> K8S & ING_HELM
-    KUBE_SEC & NS & KEDA_HELM & CERT_HELM & ING_HELM --> OUT[["Export: ClusterStackOutput<br/>(stack_data)"]]
+    NS & KEDA_HELM & CERT_HELM & ING_HELM --> OUT[["Export: ClusterStackOutput<br/>(stack_data)"]]
+    K8S --> OUT_SEC[["Export: ClusterStackSecrets<br/>(stack_secrets — encrypted kubeconfig)"]]
 ```
 
-#### Typed Output Contract (`stacks/cluster/outputs.py`)
+#### Typed Output Contracts (`stacks/cluster/outputs.py`)
 
 ```python
 class ClusterStackOutput(TypedDict):
@@ -1181,11 +1241,14 @@ class ClusterStackOutput(TypedDict):
     kapsule_version: str
     api_system_pool_id: str
     workers_pool_id: str
-    kubeconfig_secret_id: str         # Scaleway Secret Manager UUID (/docia/<boundary>/kubeconfig)
     ingress_class_name: str           # "traefik"
     cert_manager_issuer_name: str     # "letsencrypt-prod"
     load_balancer_ip: str             # Forwarded from stacks/network (for reference / OVH DNS)
     namespaces: dict[str, str]        # e.g. {"staging": "docia-staging", "sandbox": "docia-sandbox"}
+
+
+class ClusterStackSecrets(TypedDict): # Exported via pulumi.Output.secret(...) under stack_secrets
+    kubeconfig: str                   # Cluster kubeconfig consumed by stacks/apps
 ```
 
 ---
@@ -1195,23 +1258,36 @@ class ClusterStackOutput(TypedDict):
 * **Scope**: **Always** instantiated per environment (`staging`, `sandbox`, `prod`) in both Topology A and Topology B.
 * **Upstream Stack Dependencies**:
   1. `stacks/base` (`env="shared"`) $\rightarrow$ `registry_endpoint`, `cockpit_loki_url`.
-  2. `stacks/network` (`network_env`) $\rightarrow$ `cockpit_token_secret_id`.
-  3. `stacks/data` (`ctx.env`) $\rightarrow$ `s3_bucket_name`, `pg_main_private_host`, `redis_private_host`, `runtime_secrets_id`, `analytics_db_private_host`, `analytics_db_*`, `analytics_credentials_secret_id`.
-  4. `stacks/cluster` (`cluster_env`) $\rightarrow$ `kubeconfig_secret_id`, `namespaces[ctx.env]`, `ingress_class_name`, `cert_manager_issuer_name`.
+  2. `stacks/network` (`network_env`) $\rightarrow$ `stack_secrets.cockpit_loki_token`.
+  3. `stacks/analytics` (`env="shared"`) $\rightarrow$ `stack_secrets.env_db_passwords[ctx.env]`.
+  4. `stacks/data` (`ctx.env`) $\rightarrow$ `s3_bucket_name`, `pg_main_private_host`, `redis_private_host`, `analytics_db_*`, plus `stack_secrets` (`s3_access_key`, `s3_secret_key`, `pg_main_password`, `redis_username`, `redis_password`, `redis_ca_cert`).
+  5. `stacks/cluster` (`cluster_env`) $\rightarrow$ `namespaces[ctx.env]`, `ingress_class_name`, `cert_manager_issuer_name`, plus `stack_secrets.kubeconfig`.
+  6. **External App Secrets (`pulumi config set --secret`)**: Stored encrypted in `stacks/apps/Pulumi.<env>.yaml` (`OPENAI_API_KEY`, `PROCONNECT_CLIENT_SECRET`, `API_KEY_PEPPER_HASH`, `API_KEY_PEPPER_CHK`, `WEBHOOK_SECRET_ENCRYPTION_KEY`, `DOCUMENT_IA_API_KEY`).
+
+#### Role-Scoped Kubernetes Secrets Matrix (`stacks/apps`)
+
+| Kubernetes `core.v1.Secret` | Mounted Exclusively By | Contained Secrets (Least Privilege) | Explicitly Excluded |
+|---|---|---|---|
+| `docia-api-secret` | `document-ia-api` | `PG_MAIN`, `REDIS` (+ CA), `S3`, `API_KEY_PEPPER_*`, `WEBHOOK_SECRET_ENCRYPTION_KEY`, `DOCUMENT_IA_API_KEY`, `LOKI_BEARER_TOKEN` | `PG_ANALYTICS`, `OPENAI_API_KEY` (Albert), `PROCONNECT_CLIENT_SECRET` |
+| `docia-worker-secret` | `document-ia-worker` | `PG_MAIN`, `REDIS` (+ CA), `S3`, `OPENAI_API_KEY` (Albert), `LOKI_BEARER_TOKEN` | `API_KEY_PEPPER_*`, `WEBHOOK_SECRET_ENCRYPTION_KEY`, `PROCONNECT_CLIENT_SECRET`, `PG_ANALYTICS` |
+| `docia-evals-secret` | `document-ia-evals` | `PROCONNECT_CLIENT_SECRET`, `DOCUMENT_IA_API_KEY` (internal API auth), `LOKI_BEARER_TOKEN` | `PG_MAIN`, `PG_ANALYTICS`, `REDIS`, `S3`, `API_KEY_PEPPER_*`, `WEBHOOK_SECRET_ENCRYPTION_KEY` |
+| `docia-cron-ppi-secret` | `remove-ppi` CronJob | `PG_MAIN`, `LOKI_BEARER_TOKEN` | `REDIS`, `S3`, `PG_ANALYTICS`, `OPENAI_API_KEY`, `PROCONNECT_*`, `PEPPERS` |
+| `docia-cron-analytics-secret` | `replicate-analytics` CronJob | `PG_MAIN`, `PG_ANALYTICS` (`docia_<env>_analytics`), `LOKI_BEARER_TOKEN` | `REDIS`, `S3`, `OPENAI_API_KEY`, `PROCONNECT_*`, `PEPPERS` |
+| `docia-keda-redis-secret` | KEDA `TriggerAuthentication` (`docia-keda-redis-auth`) | `username`, `password`, `ca` (`DataStackSecrets.redis_ca_cert`) | All DBs, S3, Albert, ProConnect, Peppers, Loki |
 
 #### Intra-Stack Resource Dependency Graph (`stacks/apps`)
 
 ```mermaid
 flowchart TB
-    REFS[["Upstream StackReferences<br/>(stacks/base + stacks/network + stacks/data + stacks/cluster)"]]
+    REFS[["Upstream StackReferences (stack_data + encrypted stack_secrets)<br/>+ External Secrets (pulumi config set --secret in Pulumi.&lt;env&gt;.yaml)"]]
 
-    K_PROV["pulumi_kubernetes.Provider<br/>(loads kubeconfig from kubeconfig_secret_id)"]
-    K_SEC["core.v1.Secret ('docia-runtime-env')<br/>(Materialized by Pulumi from Secret Manager:<br/>DB, Redis, S3, Analytics, Peppers, Fernet, Albert, Loki, ProConnect)"]
-    NETPOL["networking.v1.NetworkPolicy<br/>(Cilium Namespace, East-West, pn-analytics:5432 & Anti-SSRF Isolation)"]
+    K_PROV["pulumi_kubernetes.Provider<br/>(loads kubeconfig from cluster stack_secrets)"]
+    K_SEC["5 Role-Scoped core.v1.Secrets<br/>(docia-api-secret, docia-worker-secret, docia-evals-secret,<br/>docia-cron-ppi-secret, docia-cron-analytics-secret)"]
+    NETPOL["networking.v1.NetworkPolicy<br/>(Cilium Namespace, East-West, pg-analytics /32:5432 & Anti-SSRF Isolation)"]
 
-    DEPLOY_API["apps.v1.Deployment + Service ('document-ia-api')<br/>(Runs AUTO_MIGRATE=true on Main DB & Analytics Schema)"]
+    DEPLOY_API["apps.v1.Deployment + Service ('document-ia-api')<br/>(Runs AUTO_MIGRATE=true on Main DB only)"]
     DEPLOY_WRK["apps.v1.Deployment ('document-ia-worker')<br/>(Prewarms 4 SHA-256 AI models, consumes event_stream)"]
-    KEDA_SO["keda.sh/v1alpha1.ScaledObject ('worker-scaler')<br/>(Redis Streams lagCount=10, +1/120s up, 300s cooldown down)"]
+    KEDA_SO["keda.sh/v1alpha1.TriggerAuthentication + ScaledObject ('worker-scaler')<br/>(Redis Streams TLS + CA + Auth, lagCount=10, +1/120s up, 300s cooldown down)"]
     DEPLOY_EVALS["apps.v1.Deployment + Service ('document-ia-evals')<br/>(Streamlit Console + ProConnect OIDC)"]
     CRON_1["batch.v1.CronJob ('remove-ppi' - 03:00 UTC)"]
     CRON_2["batch.v1.CronJob ('replicate-analytics' - 05:00 UTC)"]
@@ -1243,19 +1319,19 @@ class AppsStackOutput(TypedDict):
 
 | Exported Output Field | Producer Stack | Consumer Stack(s) | Purpose in Consumer Stack |
 |---|---|---|---|
-| `vpc_id` / `boundary_subnet_cidrs` / `analytics_subnet_cidr` | `stacks/base (shared)` | `stacks/network (<boundary>)`<br/>`stacks/analytics (shared)` | Attach every isolated `PrivateNetwork` (and `pn-analytics`) to the shared VPC under the default-deny VPC Network ACL |
+| `vpc_id` / `boundary_subnet_cidrs` / `analytics_subnet_cidr` / `analytics_db_private_ip` | `stacks/base (shared)` | `stacks/network (<boundary>)`<br/>`stacks/analytics (shared)` | Attach every isolated `PrivateNetwork` (and `pn-analytics`) to the shared VPC under the `/32`-pinned default-deny VPC Network ACL (`172.16.0.10/32:5432`) |
 | `cockpit_grafana_url` / `cockpit_loki_url` | `stacks/base (shared)` | `stacks/observability (shared)`<br/>`stacks/network (<boundary>)`<br/>`stacks/apps (<env>)` | Provision Grafana dashboards & Cockpit alerts in `stacks/observability`, create scoped push tokens, and supply `LOKI_URL` |
 | `registry_endpoint` | `stacks/base (shared)` | `stacks/apps (<env>)` | Immutable container image references (`rg.fr-par.scw.cloud/docia-shared/...`) for API, Worker, Console/Evals, and CronJobs |
 | `private_network_id` | `stacks/network (<boundary>)` | `stacks/data (<env>)`<br/>`stacks/cluster (<boundary>)` | Attach Main PostgreSQL RDB, Managed Redis 7+, Kapsule Cluster, and Load Balancer backend to the boundary's private network |
 | `lb_reserved_ip_id` / `lb_public_ip` | `stacks/network (<boundary>)` | `stacks/cluster (<boundary>)`<br/>*(OVH DNS `A` records)* | Bind the single Scaleway Load Balancer via Traefik CCM and expose the fixed IPv4 to point OVH DNS `A` records (`api.*`, `console.*`) |
-| `cockpit_token_secret_id` | `stacks/network (<boundary>)` | `stacks/apps (<env>)` | Materialize `LOKI_BEARER_TOKEN` in `docia-runtime-env` Kubernetes Secret |
-| `analytics_db_private_host` / `port` / `name` | `stacks/analytics (shared)` | `stacks/data (<env>)`<br/>`stacks/apps (<env>)` | Configure private VPC-routed `ANALYTICS_POSTGRES_*` (`172.16.0.x:5432`) on `document-ia-api`, `replicate-analytics` CronJob, and Cilium `NetworkPolicy` |
-| `env_schemas[<env>]` | `stacks/analytics (shared)` | `stacks/data (<env>)`<br/>`stacks/apps (<env>)` | Provide `ANALYTICS_POSTGRES_SCHEMA=<env>` and schema-scoped `pulumi-postgresql` writer credentials secret ID |
+| `stack_secrets.cockpit_loki_token` | `stacks/network (<boundary>)` | `stacks/apps (<env>)` | Materialize `LOKI_BEARER_TOKEN` in each workload's role-scoped Kubernetes `v1.Secret` |
+| `analytics_db_private_host` / `port` / `name` | `stacks/analytics (shared)` | `stacks/data (<env>)`<br/>`stacks/apps (<env>)` | Configure private VPC-routed `ANALYTICS_POSTGRES_*` (`172.16.0.10/32:5432`) and Cilium `NetworkPolicy` |
+| `env_schemas[<env>]` + `stack_secrets.env_db_passwords[<env>]` | `stacks/analytics (shared)` | `stacks/data (<env>)`<br/>`stacks/apps (<env>)` | Provide `ANALYTICS_POSTGRES_SCHEMA=<env>` and schema-scoped `pulumi-postgresql` writer credentials |
 | `metabase_cname_target` | `stacks/analytics (shared)` | *(OVH DNS `CNAME` record)* | Target hostname for `metabase.<domain>` in OVH enabling native Let's Encrypt TLS on the Metabase Serverless Container |
 | `pg_main_private_host` / `redis_private_host` | `stacks/data (<env>)` | `stacks/apps (<env>)` | Configure Cilium `NetworkPolicy` allowlists (`:5432`, `:6379`) and KEDA `ScaledObject` Redis Stream address |
 | `s3_bucket_name` / `s3_endpoint_url` | `stacks/data (<env>)` | `stacks/apps (<env>)` | Configure `S3_BUCKET_NAME` and `S3_ENDPOINT_URL` on `document-ia-api` and `document-ia-worker` |
-| `runtime_secrets_id` | `stacks/data (<env>)` | `stacks/apps (<env>)` | Materialize the Kubernetes `v1.Secret` (`docia-runtime-env`) directly in `stacks/apps` |
-| `kubeconfig_secret_id` / `namespaces[<env>]` / `ingress_class_name` / `cert_manager_issuer_name` | `stacks/cluster (<boundary>)` | `stacks/apps (<env>)` | Authenticate `pulumi_kubernetes.Provider`, target the environment's Namespace, and attach Traefik + `cert-manager` TLS to `Ingress` |
+| `stack_secrets` (DB/Redis/S3 creds + Redis CA) | `stacks/data (<env>)` | `stacks/apps (<env>)` | Materialize role-scoped Kubernetes `core.v1.Secret` objects (`docia-*-secret`) and KEDA `TriggerAuthentication` |
+| `namespaces[<env>]` / `ingress_class_name` / `cert_manager_issuer_name` + `stack_secrets.kubeconfig` | `stacks/cluster (<boundary>)` | `stacks/apps (<env>)` | Authenticate `pulumi_kubernetes.Provider`, target the environment's Namespace, and attach Traefik + `cert-manager` TLS to `Ingress` |
 
 ---
 
